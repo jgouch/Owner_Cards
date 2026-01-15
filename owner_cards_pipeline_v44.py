@@ -1177,12 +1177,23 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300):
             s = "" if x is None else str(x)
             return bool(s.strip()) and s.strip().lower() != "nan"
 
+        def series_or_default(col_name: str, default):
+            if col_name in owners_master.columns:
+                return owners_master[col_name]
+            return pd.Series([default] * len(owners_master), index=owners_master.index)
+
+        phone_raw = series_or_default("PhoneRaw", "")
+        phone_valid = series_or_default("PhoneValid", False)
+        phone_normalized = series_or_default("PhoneNormalized", "")
+        phone_alt_normalized = series_or_default("PhoneAltNormalized", "")
+        phone_alt_valid = series_or_default("PhoneAltValid", True)
+
         phone_exceptions = owners_master[
-            (owners_master.get("PhoneRaw", "").apply(has_text)) &
+            phone_raw.apply(has_text) &
             (
-                (owners_master.get("PhoneValid", False) == False) |
-                (owners_master.get("PhoneNormalized", "").apply(lambda x: not has_text(x))) |
-                ((owners_master.get("PhoneAltNormalized", "").apply(has_text)) & (owners_master.get("PhoneAltValid", True) == False))
+                (phone_valid == False) |
+                (phone_normalized.apply(lambda x: not has_text(x))) |
+                (phone_alt_normalized.apply(has_text) & (phone_alt_valid == False))
             )
         ].copy()
 
