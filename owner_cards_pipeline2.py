@@ -287,8 +287,14 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
         matches = [m.group(0) for m in PHONE_PATTERN.finditer(full_text or "")]
 
     seen_digits = set()
+    seen_raw = set()
+    raw_candidates = []
     candidates = []
     for raw in matches:
+        raw_norm = normalize_ws(raw)
+        if raw_norm and raw_norm not in seen_raw:
+            raw_candidates.append(raw_norm)
+            seen_raw.add(raw_norm)
         d = _digits_only(raw)
         if not d or d in seen_digits:
             continue
@@ -313,7 +319,7 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
         if rest:
             alt = rest[0]
 
-    phone_raw = " | ".join([c[0] for c in candidates[:2]])
+    phone_raw = " | ".join(raw_candidates[:2])
 
     return {
         "PhoneRaw": phone_raw,
@@ -380,12 +386,12 @@ def force_string_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 # PDF TEXT LAYER (Adobe OCR)
 # -----------------------------
 
-def extract_pdf_text_page(pdf_path: str, page_index: int) -> str:
+def extract_pdf_text_page(pdf_path: str, page_index: int, reader: Optional[PdfReader] = None) -> str:
     try:
-        reader = PdfReader(pdf_path)
-        if page_index >= len(reader.pages):
+        pdf_reader = reader if reader is not None else PdfReader(pdf_path)
+        if page_index >= len(pdf_reader.pages):
             return ""
-        return reader.pages[page_index].extract_text() or ""
+        return pdf_reader.pages[page_index].extract_text() or ""
     except Exception:
         return ""
 
@@ -847,9 +853,15 @@ def score_text_pass(txt: str) -> int:
 # PAGE PROCESSOR
 # -----------------------------
 
-def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str]) -> Tuple[Dict, List[Dict], bool]:
+def process_page(
+    pdf_path: str,
+    page_index: int,
+    dpi: int,
+    target_char: Optional[str],
+    reader: Optional[PdfReader] = None,
+) -> Tuple[Dict, List[Dict], bool]:
     # TEXT LAYER FIRST
-    pdf_text = extract_pdf_text_page(pdf_path, page_index)
+    pdf_text = extract_pdf_text_page(pdf_path, page_index, reader=reader)
     if text_layer_usable(pdf_text):
         txt = pdf_text
         lines = split_lines(txt)
@@ -1018,13 +1030,22 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300):
 
     print(f"\n[Info] Processing '{filename}' | Target: '{target_char}' | Prefix: {record_prefix}")
 
+    pdf_reader = None
+    try:
+        pdf_reader = PdfReader(pdf_path)
+    except Exception:
+        pdf_reader = None
+
     # page count fast path
     try:
         info = pdfinfo_from_path(pdf_path)
         page_count = info["Pages"]
     except Exception:
         try:
-            page_count = len(PdfReader(pdf_path).pages)
+            if pdf_reader is not None:
+                page_count = len(pdf_reader.pages)
+            else:
+                page_count = len(PdfReader(pdf_path).pages)
         except Exception:
             thumbs = convert_from_path(pdf_path, dpi=50)
             page_count = len(thumbs)
@@ -1034,7 +1055,7 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300):
     interment_rows = []
 
     for p in tqdm(range(page_count), desc=f"Scanning {filename}", unit="page"):
-        owner_data, items_data, is_interment = process_page(pdf_path, p, dpi, target_char)
+        owner_data, items_data, is_interment = process_page(pdf_path, p, dpi, target_char, reader=pdf_reader)
 
         rec_id = f"{record_prefix}-P{p+1:04d}"
         owner_data["OwnerRecordID"] = rec_id
@@ -1152,7 +1173,6 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300):
     owners_master = force_string_cols(owners_master, ["ZIP", "OwnerRecordID", "OwnerGroupKey"])
 
     # Lists
-    list_memorial = owners_master[(owners_master.get("HasProperty", False) == "True") | (owners_master.get("HasProperty", False) == True)]
     if not owners_master.empty:
         list_memorial = owners_master[(owners_master["HasProperty"] == True) & (owners_master["HasMemorial"] != True) & (owners_master["LivingOwnerExists"] == True)].copy()
         list_pn = owners_master[(owners_master["HasProperty"] == True) & (owners_master["HasFuneralPreneedPlanStatus"].isin(["FALSE", "PARTIAL"])) & (owners_master["LivingOwnerExists"] == True)].copy()
