@@ -611,14 +611,24 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
         street = normalize_ws(street_part)
         city = normalize_ws(city_part)
     else:
-        # try to split by the last double-space-ish boundary; fall back
-        parts = before_state.split(" ")
-        if len(parts) >= 3:
-            street = " ".join(parts[:-1])
-            city = parts[-1]
+        # try to split by a known city ending; fall back to last token
+        upper_before = before_state.upper()
+        city_match = None
+        for city_name in sorted(CITY_BLOCKLIST, key=len, reverse=True):
+            if upper_before.endswith(f" {city_name}"):
+                city_match = city_name
+                break
+        if city_match:
+            street = normalize_ws(before_state[: -len(city_match)].rstrip())
+            city = normalize_ws(city_match)
         else:
-            street = before_state
-            city = ""
+            parts = before_state.split()
+            if len(parts) >= 3:
+                street = " ".join(parts[:-1])
+                city = parts[-1]
+            else:
+                street = before_state
+                city = ""
 
     return {
         "Street": street,
@@ -700,7 +710,7 @@ def parse_best_address(lines: List[str]) -> Dict:
                 "CityStateZip": "",
                 "Score": score,
             })
- not candidates:
+    if not candidates:
         for i, line in enumerate(lines):
             if looks_like_address_line(line):
                 return {"Index": i, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": line}
