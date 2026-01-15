@@ -671,7 +671,36 @@ def parse_best_address(lines: List[str]) -> Dict:
                 "Score": score,
             })
 
+    
+    # --- OPTIONAL: street-only fallback (when ZIP/state is missing) ---
+    # If we couldn't find any ZIP+state anchored candidates, try to at least capture a street line.
     if not candidates:
+        for i, line in enumerate(lines):
+            ln = normalize_ws(line)
+            if not ln:
+                continue
+
+            # Must look like a street address (starts with number + space + text)
+            if not re.search(STREET_START_RE, ln):
+                continue
+
+            # Light scoring: prefer lines that also contain common address tokens
+            score = 25
+            if matches_any(ln, RE_ADDR_BLOCK):
+                score += 10
+            if "," in ln:
+                score -= 5  # comma often indicates it's not pure street (but keep it)
+
+            candidates.append({
+                "Index": i,
+                "Street": clean_address_line(ln),
+                "City": "",
+                "State": "",
+                "ZIP": "",
+                "CityStateZip": "",
+                "Score": score,
+            })
+ not candidates:
         for i, line in enumerate(lines):
             if looks_like_address_line(line):
                 return {"Index": i, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": line}
