@@ -26,6 +26,7 @@ import hashlib
 import os
 import re
 import unicodedata
+from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
@@ -1004,7 +1005,7 @@ def try_kraken_text(pil_img: Image.Image, model_path: str = "", kraken_bin: str 
 def is_gibberish(text: str) -> bool:
     if not text or len(text) < 3:
         return True
-    if not any(c.isupper() for c in text):
+    if not any(c.isalpha() for c in text):
         return True
     if not re.search(r"[AEIOUYaeiouy]", text):
         return True
