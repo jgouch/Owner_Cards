@@ -26,6 +26,7 @@ import hashlib
 import os
 import re
 import unicodedata
+from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
@@ -629,6 +630,8 @@ def detect_horizontal_strikelines(img_bgr: np.ndarray) -> List[Tuple[int, int, i
     for l in lines[:, 0, :]:
         x1, y1, x2, y2 = map(int, l)
         if abs(y2 - y1) <= 3 and abs(x2 - x1) >= 80:
+            if y1 < int(height * 0.08) or y1 > int(height * 0.95):
+                continue
             segs.append((x1, y1, x2, y2))
     return segs
 
@@ -763,7 +766,16 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
                 street = " ".join(street_tokens)
                 city = " ".join(city_tokens)
             else:
-                if len(parts) >= 3 and parts[-1].upper() not in DIRECTIONAL_TOKENS:
+                if (
+                    len(parts) >= 4
+                    and parts[-1].isalpha()
+                    and parts[-2].isalpha()
+                    and parts[-1].upper() not in DIRECTIONAL_TOKENS
+                    and parts[-2].upper() not in DIRECTIONAL_TOKENS
+                ):
+                    street = " ".join(parts[:-2])
+                    city = " ".join(parts[-2:])
+                elif len(parts) >= 3 and parts[-1].upper() not in DIRECTIONAL_TOKENS:
                     street = " ".join(parts[:-1])
                     city = parts[-1]
                 else:
@@ -1299,9 +1311,12 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
                 needs_review = True
                 review_notes.append('NAME_MISSING')
                 try:
-                    imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index+1, last_page=page_index+1)
-                    if imgs:
-                        save_failure_snapshot(imgs[0].convert('RGB'), pdf_path, page_index+1, reason='NAME_MISSING')
+                    if strike_pil is not None:
+                        save_failure_snapshot(strike_pil, pdf_path, page_index+1, reason='NAME_MISSING')
+                    else:
+                        img = render_page(pdf_path, page_index, dpi=dpi)
+                        if img is not None:
+                            save_failure_snapshot(img.convert('RGB'), pdf_path, page_index+1, reason='NAME_MISSING')
                 except Exception:
                     pass
             if (not addr.get('State')) or (not addr.get('ZIP')):
