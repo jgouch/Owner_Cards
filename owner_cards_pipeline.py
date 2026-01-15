@@ -59,7 +59,7 @@ STATE_MAP = {
     "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA",
     "WEST VIRGINIA": "WV", "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
     "TENN": "TN", "TENNESSES": "TN", "TEN": "TN", "TENN.": "TN", "TN.": "TN",
-    "TIN": "TN", "IN": "TN" 
+    "TIN": "TN", "IN": "IN" 
 }
 
 CITY_BLOCKLIST = [
@@ -214,16 +214,15 @@ def split_lines(raw_text: str) -> List[str]:
 
 def extract_phone(text: str) -> Tuple[str, bool]:
     phones = []
-    m_full = re.findall(r"(?:\(?(\d{3})\)?[\s\-\./]?)?(\d{3})[\s\-\./]?(\d{4})", text or "")
+    m_full = re.findall(r"\(?(\d{3})\)?[\s\-\./]?(\d{3})[\s\-\./]?(\d{4})", text or "")
     for area, pre, suf in m_full:
-        if not area: area = "615"
         if len(area) == 3 and len(pre) == 3 and len(suf) == 4:
             phones.append(f"({area}) {pre}-{suf}")
-    
+
     # Also check for 7-digit without area code
     m7 = re.search(r"\b(\d{3})[\s\-\./]?(\d{4})\b", text or "")
     if m7 and not phones:
-         return (f"{m7.group(1)}-{m7.group(2)}", False)
+        return (f"{m7.group(1)}-{m7.group(2)}", False)
 
     return (phones[0] if phones else "", True if phones else False)
 
@@ -368,9 +367,10 @@ def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple
 # TEXT LAYER (Adobe OCR)
 # -----------------------------
 
-def extract_pdf_text_page(pdf_path: str, page_index: int) -> str:
+def extract_pdf_text_page(pdf_path: str, page_index: int, reader: Optional[PdfReader] = None) -> str:
     try:
-        reader = PdfReader(pdf_path)
+        if reader is None:
+            reader = PdfReader(pdf_path)
         if page_index >= len(reader.pages): return ""
         return reader.pages[page_index].extract_text() or ""
     except Exception: return ""
@@ -673,9 +673,9 @@ def score_text_pass(txt: str) -> int:
 # PAGE PROCESSOR (V43 Hybrid)
 # -----------------------------
 
-def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str]) -> Tuple[Dict, List[Dict], bool]:
+def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str], reader: Optional[PdfReader] = None) -> Tuple[Dict, List[Dict], bool]:
     # 1. TEXT LAYER FIRST (TRUST BUT VERIFY)
-    pdf_text = extract_pdf_text_page(pdf_path, page_index)
+    pdf_text = extract_pdf_text_page(pdf_path, page_index, reader=reader)
     use_text_layer = False
     
     if text_layer_usable(pdf_text):
@@ -829,9 +829,14 @@ def process_dataset(pdf_path, out_path, dpi=300):
     owners_rows = []
     items_rows = []
     interment_rows = [] 
+    reader = None
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception:
+        reader = None
 
     for p in tqdm(range(page_count), desc=f"Scanning {filename}", unit="page"):
-        owner_data, items_data, is_interment = process_page(pdf_path, p, dpi, target_char)
+        owner_data, items_data, is_interment = process_page(pdf_path, p, dpi, target_char, reader=reader)
         
         rec_id = f"{record_prefix}-P{p+1:04d}"
         owner_data["OwnerRecordID"] = rec_id
