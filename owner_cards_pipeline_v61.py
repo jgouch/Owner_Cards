@@ -27,6 +27,7 @@ import os
 import re
 import unicodedata
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -870,7 +871,7 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
         "City": city,
         "State": st,
         "ZIP": z,
-        "CityStateZip": line,
+        "CityStateZip": normalize_ws(line2),
         "Inline": True,
     }
 
@@ -994,7 +995,7 @@ def parse_best_address(lines: List[str]) -> Dict:
     zipc = best.get("ZIP", "")
 
     # if city wasn't parsed, derive from CityStateZip
-    if not city and best.get("CityStateZip") and state and not best.get("Inline"):
+    if not city and best.get("CityStateZip") and state:
         m = re.search(US_STATE_RE, best["CityStateZip"], re.IGNORECASE)
         if m:
             city_part = best["CityStateZip"][:m.start()]
@@ -1221,7 +1222,7 @@ def parse_owner_header(lines: List[str], target_char: Optional[str] = None) -> T
     if "," in primary:
         last_name = primary.split(",")[0].strip()
     elif " " in primary:
-        last_name = primary.split(" ")[0].strip()
+        last_name = primary.split(" ")[-1].strip()
     else:
         last_name = primary
 
