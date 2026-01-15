@@ -1416,7 +1416,7 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
     phone_fields = extract_phone_fields(best_text, lines_best)
     # NeedsReview: OCR fallback is inherently less reliable
     needs_review = True
-    review_notes: List[str] = [f"OCR_FALLBACK_{best_name}", f"HEADER_{header_meta.get("best","")}"]
+    review_notes: List[str] = [f"OCR_FALLBACK_{best_name}", f"HEADER_{header_meta.get('best','')}"]
     if deep_ocr_applied:
         review_notes.append('DEEP_OCR_2X')
     if alt_ocr_applied:
@@ -1461,7 +1461,7 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
         "RawText": combined_raw,
         "RawTextHash": sha1_text(combined_raw),
         "TemplateType": template_type,
-        "TextSource": f"OCR_FALLBACK_{best_name}_S{best_score}_HEADER_{header_meta.get("best","")}",
+        "TextSource": f"OCR_FALLBACK_{best_name}_S{best_score}_HEADER_{header_meta.get('best','')}",
         "NeedsReview": 'TRUE',
         "NeedsReviewNotes": '; '.join(review_notes),
     }
@@ -1589,10 +1589,10 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
     inc = items_df[items_df.get("Include", False) == True].copy() if not items_df.empty else pd.DataFrame()
 
     def agg_owner(group: pd.DataFrame) -> pd.Series:
-        has_property = bool(group.get("IsProperty", False).any())
-        has_memorial = bool(group.get("IsMemorial", False).any())
-        has_pn = bool(group.get("IsFuneralPreneed", False).any())
-        has_an = bool(group.get("IsAtNeedFuneral", False).any())
+        has_property = bool(group["IsProperty"].any()) if "IsProperty" in group else False
+        has_memorial = bool(group["IsMemorial"].any()) if "IsMemorial" in group else False
+        has_pn = bool(group["IsFuneralPreneed"].any()) if "IsFuneralPreneed" in group else False
+        has_an = bool(group["IsAtNeedFuneral"].any()) if "IsAtNeedFuneral" in group else False
 
         memorial_lines = group[group.get("IsMemorial", False) == True]["LineText"].tolist() if "LineText" in group else []
         pn_lines = group[group.get("IsFuneralPreneed", False) == True]["LineText"].tolist() if "LineText" in group else []
