@@ -74,6 +74,12 @@ CITY_BLOCKLIST = [
 US_STATE_RE = r"\b(" + "|".join(sorted(set(list(STATE_MAP.keys()) + list(STATE_MAP.values())), key=len, reverse=True)) + r")\b"
 ZIP_RE = r"\b\d{5}(?:-\d{4})?\b"
 STREET_START_RE = r"^\d+\s+[A-Za-z0-9]"
+STREET_SUFFIXES = {
+    "ST", "STREET", "AVE", "AVENUE", "RD", "ROAD", "DR", "DRIVE", "LN", "LANE",
+    "CT", "COURT", "BLVD", "BOULEVARD", "HWY", "HIGHWAY", "PKWY", "PARKWAY",
+    "CIR", "CIRCLE", "PL", "PLACE", "WAY", "TRL", "TRAIL", "TER", "TERRACE",
+}
+DIRECTIONAL_TOKENS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
 
 NAME_BLACKLIST = [
     r"\btransfer", r"\bsold\s+to", r"\bgiven\s+to", r"\bspaces",
@@ -292,6 +298,8 @@ def _normalize_phone_digits(d: str) -> Tuple[str, bool, bool]:
 
 def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
     header_text = "\n".join(lines[:18]) if lines else (full_text or "")
+    header_upper = header_text.upper()
+    allow_seven_digit = any(token in header_upper for token in ["PHONE", "TEL", "TELEPHONE"])
     matches = [m.group(0) for m in PHONE_PATTERN.finditer(header_text)]
     if not matches:
         matches = [m.group(0) for m in PHONE_PATTERN.finditer(full_text or "")]
@@ -301,6 +309,8 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
     for raw in matches:
         raw_main = _strip_phone_extension(raw)
         d = _digits_only(raw_main)
+        if len(d) == 7 and not allow_seven_digit:
+            continue
         if not d or d in seen:
             continue
         seen.add(d)
@@ -520,10 +530,13 @@ def group_text_lines_from_ocr(data: Dict) -> List[Dict]:
 def detect_horizontal_strikelines(img_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 15)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 1))
+    height, width = gray.shape[:2]
+    kernel_width = max(35, int(width * 0.03))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
     horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
     edges = cv2.Canny(horiz, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=80, maxLineGap=10)
+    min_len = max(80, int(width * 0.08))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=min_len, maxLineGap=10)
     segs: List[Tuple[int, int, int, int]] = []
     if lines is None:
         return segs
@@ -638,7 +651,7 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
         street = normalize_ws(street_part)
         city = normalize_ws(city_part)
     else:
-        # try to split by a known city ending; fall back to last token
+        # try to split by a known city ending or a street suffix marker
         upper_before = before_state.upper()
         city_match = None
         for city_name in sorted(CITY_BLOCKLIST, key=len, reverse=True):
@@ -650,12 +663,26 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
             city = normalize_ws(city_match)
         else:
             parts = before_state.split()
-            if len(parts) >= 3:
-                street = " ".join(parts[:-1])
-                city = parts[-1]
+            suffix_idx = None
+            for i in range(len(parts)):
+                token = parts[i].rstrip(".").upper()
+                if token in STREET_SUFFIXES:
+                    suffix_idx = i
+            if suffix_idx is not None and suffix_idx + 1 < len(parts):
+                street_tokens = parts[: suffix_idx + 1]
+                city_tokens = parts[suffix_idx + 1 :]
+                if city_tokens and city_tokens[0].upper() in DIRECTIONAL_TOKENS:
+                    street_tokens.append(city_tokens[0])
+                    city_tokens = city_tokens[1:]
+                street = " ".join(street_tokens)
+                city = " ".join(city_tokens)
             else:
-                street = before_state
-                city = ""
+                if len(parts) >= 3 and parts[-1].upper() not in DIRECTIONAL_TOKENS:
+                    street = " ".join(parts[:-1])
+                    city = parts[-1]
+                else:
+                    street = before_state
+                    city = ""
 
     return {
         "Street": street,
@@ -663,6 +690,7 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
         "State": st,
         "ZIP": z,
         "CityStateZip": line,
+        "Inline": True,
     }
 
 
@@ -682,6 +710,7 @@ def parse_best_address(lines: List[str]) -> Dict:
                     "ZIP": inline["ZIP"],
                     "CityStateZip": inline["CityStateZip"],
                     "Score": 95 if inline.get("City") else 85,
+                    "Inline": True,
                 })
                 continue
 
@@ -784,7 +813,7 @@ def parse_best_address(lines: List[str]) -> Dict:
     zipc = best.get("ZIP", "")
 
     # if city wasn't parsed, derive from CityStateZip
-    if not city and best.get("CityStateZip") and state:
+    if not city and best.get("CityStateZip") and state and not best.get("Inline"):
         m = re.search(US_STATE_RE, best["CityStateZip"], re.IGNORECASE)
         if m:
             city_part = best["CityStateZip"][:m.start()]
@@ -1080,7 +1109,8 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
             phone_fields = extract_phone_fields(txt, lines)
 
             # ---- Strike detection parity ----
-            strike_segs, strike_pil = detect_strike_segs_for_page(pdf_path, page_index, dpi=min(150, max(110, dpi//2)))
+            strike_dpi = min(200, max(150, dpi // 2))
+            strike_segs, strike_pil = detect_strike_segs_for_page(pdf_path, page_index, dpi=strike_dpi)
             if strike_segs and strike_pil is not None:
                 # Build items via OCR using the SAME render used for strike detection (avoids DPI/coordinate mismatch)
                 items = [] if is_interment else ocr_items_with_strike_from_image(strike_pil, strike_segs=strike_segs)
