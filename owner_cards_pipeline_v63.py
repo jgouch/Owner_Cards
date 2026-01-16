@@ -26,6 +26,7 @@ import hashlib
 import os
 import re
 import unicodedata
+from functools import lru_cache
 from datetime import datetime
 import difflib
 from pathlib import Path
@@ -108,6 +109,7 @@ FAILED_SNAPSHOT_DIR = "_Failed_Snapshots"
 # FaCTS SECTION (Garden) VALIDATION
 # -----------------------------
 
+@lru_cache(maxsize=2048)
 def normalize_section_name(name: str) -> str:
     if name is None:
         return ''
@@ -194,6 +196,7 @@ def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page
 
     # Address completeness
     if not owner.get('State') or not owner.get('ZIP'):
+        needs_review = True
         notes.append('ADDR_STATE_ZIP_MISSING')
 
     # Property section validation
@@ -1245,13 +1248,15 @@ def parse_best_address(lines: List[str]) -> Dict:
             city_part = best["CityStateZip"][:m.start()]
             city = normalize_ws(city_part).replace(",", "")
 
+    address_raw = best.get("CityStateZip", "") if best.get("Inline") else f"{street} | {best.get('CityStateZip','')}".strip(" |")
+
     return {
         "Index": best.get("Index"),
         "Street": street,
         "City": city,
         "State": state,
         "ZIP": zipc,
-        "AddressRaw": f"{street} | {best.get('CityStateZip','')}".strip(" |"),
+        "AddressRaw": address_raw,
     }
 
 
