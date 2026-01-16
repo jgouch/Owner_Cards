@@ -1874,13 +1874,13 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
         "RawTextHash": sha1_text(combined_raw),
         "TemplateType": template_type,
         "TextSource": f"OCR_FALLBACK_{best_name}_S{best_score}",
-            # v65: capture which header OCR backend won (useful diagnostics)
-            "HeaderOCRBest": header_meta.get('best','') if isinstance(header_meta, dict) else '',
-            "HeaderOCRScore": header_meta.get('score','') if isinstance(header_meta, dict) else '',
-            "HeaderOCRUsedTesseract": bool(header_meta.get('tesseract')) if isinstance(header_meta, dict) else False,
-            "HeaderOCRUsedOCRmacVision": bool(header_meta.get('ocrmac_vision')) if isinstance(header_meta, dict) else False,
-            "HeaderOCRUsedOCRmacLiveText": bool(header_meta.get('ocrmac_livetext')) if isinstance(header_meta, dict) else False,
-            "HeaderOCRUsedKraken": bool(header_meta.get('kraken')) if isinstance(header_meta, dict) else False,
+        # v65: capture which header OCR backend won (useful diagnostics)
+        "HeaderOCRBest": header_meta.get('best','') if isinstance(header_meta, dict) else '',
+        "HeaderOCRScore": header_meta.get('score','') if isinstance(header_meta, dict) else '',
+        "HeaderOCRUsedTesseract": bool(header_meta.get('tesseract')) if isinstance(header_meta, dict) else False,
+        "HeaderOCRUsedOCRmacVision": bool(header_meta.get('ocrmac_vision')) if isinstance(header_meta, dict) else False,
+        "HeaderOCRUsedOCRmacLiveText": bool(header_meta.get('ocrmac_livetext')) if isinstance(header_meta, dict) else False,
+        "HeaderOCRUsedKraken": bool(header_meta.get('kraken')) if isinstance(header_meta, dict) else False,
     }
     owner.update(phone_fields)
     owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=pil_original, facts_sections=facts_sections, facts_mode=facts_mode)
