@@ -685,7 +685,7 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
     zip_tails = {z[-3:] for z in zips_in_header}
     header_upper = header_text.upper()
     allow_seven_digit = any(token in header_upper for token in ["PHONE", "TEL", "TELEPHONE"])
-    matches = [m.group(0) for m in PHONE_PATTERN.finditer(header_text_clean)]
+    matches = [m.group(0) for m in PHONE_PATTERN.finditer(header_text)]
     if not matches:
         matches = [m.group(0) for m in PHONE_PATTERN.finditer(full_text or "")]
 
@@ -1204,7 +1204,6 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
 
 
 def parse_best_address(lines: List[str]) -> Dict:
-    STATE_ZIP_ADJACENT = True
     """Pick best address candidate; now supports inline address lines."""
     candidates = []
     for i, line in enumerate(lines):
@@ -1263,93 +1262,93 @@ def parse_best_address(lines: List[str]) -> Dict:
     
     
 
-# v69: adjacent-line salvage: state on one line, ZIP on next (or vice versa)
-if not candidates:
-    for i, line in enumerate(lines[:30]):
-        if not line:
-            continue
-        z, st = extract_zip_state(line)
-        # state present, zip missing: look next line
-        if (st and not z) and (i+1 < len(lines)):
-            z2, st2 = extract_zip_state(lines[i+1])
-            if z2 and not st2:
-                street = clean_address_line(lines[i-1]) if i-1 >= 0 else ''
-                candidates.append({"Index": i-1 if i-1>=0 else i, "Street": street, "City": "", "State": st, "ZIP": z2, "CityStateZip": f"{line} {lines[i+1]}", "Score": 70})
-                break
-        # zip present, state missing: look previous line
-        if (z and not st) and (i-1 >= 0):
-            z2, st2 = extract_zip_state(lines[i-1])
-            if st2 and not z2:
-                street = clean_address_line(lines[i-2]) if i-2 >= 0 else ''
-                candidates.append({"Index": i-2 if i-2>=0 else i-1, "Street": street, "City": "", "State": st2, "ZIP": z, "CityStateZip": f"{lines[i-1]} {line}", "Score": 70})
-                break
-# --- OPTIONAL: street-only fallback (when ZIP/state is missing) ---
-    # If we couldn't find any ZIP+state anchored candidates, try to at least capture a street line.
+    # v69: adjacent-line salvage: state on one line, ZIP on next (or vice versa)
     if not candidates:
-        TOP_N = 25
-        scan = lines[:TOP_N]
-
-        exclude_keywords = (
-            "OWNER ID", "OWNER SINCE", "ITEM DESCRIPTION", "CONTRACT", "USED", "SALES DATE", "PRICE",
-            "LOT", "SECTION", "SEC", "BLOCK", "SP", "SPACE", "GARDEN", "MAUS", "MAUSOLEUM",
-            "INTERMENT", "BURIAL", "DECEASED", "DOD", "DOB"
-        )
-
-        street_suffixes = {
-            "ST", "ST.", "AVE", "AVE.", "RD", "RD.", "DR", "DR.", "LN", "LN.",
-            "CT", "CT.", "BLVD", "BLVD.", "HWY", "PKWY", "CIR", "PL", "WAY", "TRL", "TER"
-        }
-
-        best = None  # (score, idx, cleaned)
-
-        for i, line in enumerate(scan):
-            ln = normalize_ws(line)
-            if not ln:
+        for i, line in enumerate(lines[:30]):
+            if not line:
                 continue
+            z, st = extract_zip_state(line)
+            # state present, zip missing: look next line
+            if (st and not z) and (i + 1 < len(lines)):
+                z2, st2 = extract_zip_state(lines[i + 1])
+                if z2 and not st2:
+                    street = clean_address_line(lines[i - 1]) if i - 1 >= 0 else ''
+                    candidates.append({"Index": i - 1 if i - 1 >= 0 else i, "Street": street, "City": "", "State": st, "ZIP": z2, "CityStateZip": f"{line} {lines[i + 1]}", "Score": 70})
+                    break
+            # zip present, state missing: look previous line
+            if (z and not st) and (i - 1 >= 0):
+                z2, st2 = extract_zip_state(lines[i - 1])
+                if st2 and not z2:
+                    street = clean_address_line(lines[i - 2]) if i - 2 >= 0 else ''
+                    candidates.append({"Index": i - 2 if i - 2 >= 0 else i - 1, "Street": street, "City": "", "State": st2, "ZIP": z, "CityStateZip": f"{lines[i - 1]} {line}", "Score": 70})
+                    break
+        # --- OPTIONAL: street-only fallback (when ZIP/state is missing) ---
+        # If we couldn't find any ZIP+state anchored candidates, try to at least capture a street line.
+        if not candidates:
+            TOP_N = 25
+            scan = lines[:TOP_N]
 
-            u = ln.upper()
-            if any(k in u for k in exclude_keywords):
-                continue
+            exclude_keywords = (
+                "OWNER ID", "OWNER SINCE", "ITEM DESCRIPTION", "CONTRACT", "USED", "SALES DATE", "PRICE",
+                "LOT", "SECTION", "SEC", "BLOCK", "SP", "SPACE", "GARDEN", "MAUS", "MAUSOLEUM",
+                "INTERMENT", "BURIAL", "DECEASED", "DOD", "DOB"
+            )
 
-            if not re.search(STREET_START_RE, ln):
-                continue
+            street_suffixes = {
+                "ST", "ST.", "AVE", "AVE.", "RD", "RD.", "DR", "DR.", "LN", "LN.",
+                "CT", "CT.", "BLVD", "BLVD.", "HWY", "PKWY", "CIR", "PL", "WAY", "TRL", "TER"
+            }
 
-            cleaned = clean_address_line(ln)
-            if not cleaned:
-                continue
+            best = None  # (score, idx, cleaned)
 
-            if not any(ch.isalpha() for ch in cleaned):
-                continue
+            for i, line in enumerate(scan):
+                ln = normalize_ws(line)
+                if not ln:
+                    continue
 
-            score = 100 - i
-            toks = set(re.split(r"\s+", cleaned.upper()))
-            if toks.intersection(street_suffixes):
-                score += 15
-            if matches_any(cleaned, RE_ADDR_BLOCK):
-                score += 5
-            if "," in cleaned:
-                score -= 5
+                u = ln.upper()
+                if any(k in u for k in exclude_keywords):
+                    continue
 
-            cand = (score, i, cleaned)
-            if (best is None) or (cand[0] > best[0]):
-                best = cand
+                if not re.search(STREET_START_RE, ln):
+                    continue
 
-        if best is not None:
-            _, idx2, best_street = best
-            candidates.append({
-                "Index": idx2,
-                "Street": best_street,
-                "City": "",
-                "State": "",
-                "ZIP": "",
-                "CityStateZip": "",
-                "Score": 35,
-            })
-    if not candidates:
-        for i, line in enumerate(lines):
-            if looks_like_address_line(line):
-                return {"Index": i, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": line}
-        return {"Index": None, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": ""}
+                cleaned = clean_address_line(ln)
+                if not cleaned:
+                    continue
+
+                if not any(ch.isalpha() for ch in cleaned):
+                    continue
+
+                score = 100 - i
+                toks = set(re.split(r"\s+", cleaned.upper()))
+                if toks.intersection(street_suffixes):
+                    score += 15
+                if matches_any(cleaned, RE_ADDR_BLOCK):
+                    score += 5
+                if "," in cleaned:
+                    score -= 5
+
+                cand = (score, i, cleaned)
+                if (best is None) or (cand[0] > best[0]):
+                    best = cand
+
+            if best is not None:
+                _, idx2, best_street = best
+                candidates.append({
+                    "Index": idx2,
+                    "Street": best_street,
+                    "City": "",
+                    "State": "",
+                    "ZIP": "",
+                    "CityStateZip": "",
+                    "Score": 35,
+                })
+        if not candidates:
+            for i, line in enumerate(lines):
+                if looks_like_address_line(line):
+                    return {"Index": i, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": line}
+            return {"Index": None, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": ""}
 
     best = sorted(candidates, key=lambda x: x["Score"], reverse=True)[0]
     street = best.get("Street", "")
