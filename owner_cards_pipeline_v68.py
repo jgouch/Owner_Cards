@@ -1934,31 +1934,45 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
         template_type = detect_template_type(txt)
         _, p, s, last, addr, is_interment = parse_owner_header(lines, target_char)
 
+        owner_header_meta = {}
+        phone_fields = extract_phone_fields(txt, lines)
+        # v65: If PDF text layer is usable but lacks phone data, run header OCR to recover phones
+        # v68: Also try header OCR if the primary name looks missing.
+        try:
+            needs_header_ocr = (
+                (not p) or ("[MISSING" in (p or ""))
+                or ((not phone_fields.get('PhoneValid')) and (not (phone_fields.get('PhoneRaw') or phone_fields.get('Phone') or phone_fields.get('PhoneNormalized'))))
+            )
+            if needs_header_ocr:
+                pil_h = render_page_deskew(pdf_path, page_index, dpi=min(dpi, 300))
+                if pil_h is not None:
+                    htxt, hmeta = ocr_header_ensemble(
+                        pil_h,
+                        kraken_model=kraken_model,
+                        kraken_bin=kraken_bin,
+                        kraken_python=kraken_python,
+                        allow_livetext=allow_livetext,
+                        alt_ocr=alt_ocr,
+                    )
+                    hlines = split_lines(htxt)
+                    _, p2, s2, last2, addr2, _ = parse_owner_header(hlines, target_char)
+                    if p2 and '[MISSING' not in (p2.upper()):
+                        p, s, last = p2, s2, last2
+                    if addr2:
+                        addr['Street'] = addr.get('Street') or addr2.get('Street', '')
+                        addr['City'] = addr.get('City') or addr2.get('City', '')
+                        addr['State'] = addr.get('State') or addr2.get('State', '')
+                        addr['ZIP'] = addr.get('ZIP') or addr2.get('ZIP', '')
+                    p2_phone = extract_phone_fields(htxt, hlines)
+                    if p2_phone.get('PhoneValid') and p2_phone.get('PhoneNormalized'):
+                        phone_fields.update(p2_phone)
+                    owner_header_meta = hmeta
+        except Exception:
+            pass
+
         # trust-but-verify
         ok = bool(p) and "[MISSING" not in p
         if ok:
-            owner_header_meta = {}
-            phone_fields = extract_phone_fields(txt, lines)
-            # v65: If PDF text layer is usable but lacks phone data, run header OCR to recover phones
-            try:
-                if (not phone_fields.get('PhoneValid')) and (not (phone_fields.get('PhoneRaw') or phone_fields.get('Phone') or phone_fields.get('PhoneNormalized'))):
-                    pil_h = render_page_deskew(pdf_path, page_index, dpi=min(dpi, 300))
-                    if pil_h is not None:
-                        htxt, hmeta = ocr_header_ensemble(
-                            pil_h,
-                            kraken_model=kraken_model,
-                            kraken_bin=kraken_bin,
-                            kraken_python=kraken_python,
-                            allow_livetext=allow_livetext,
-                            alt_ocr=alt_ocr,
-                        )
-                        hlines = split_lines(htxt)
-                        p2 = extract_phone_fields(htxt, hlines)
-                        if p2.get('PhoneValid') and p2.get('PhoneNormalized'):
-                            phone_fields.update(p2)
-                        owner_header_meta = hmeta
-            except Exception:
-                pass
 
             # ---- Strike detection parity ----
             strike_segs = []
