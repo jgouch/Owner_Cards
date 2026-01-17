@@ -572,7 +572,6 @@ def heuristic_is_property(line: str) -> bool:
         elif has_d and len(t) <= 4:
             score += 1
     return score >= 3
-    return any(p.search(line or "") for p in patterns)
 
 RE_FUNERAL_PN = compile_any(FUNERAL_PN_PATTERNS)
 RE_AT_NEED = compile_any(AT_NEED_FUNERAL_PATTERNS)
@@ -2178,14 +2177,14 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
             "PropertyEvidence": " || ".join(property_lines[:3]),
         })
 
-def agg_owner_any(group: pd.DataFrame) -> pd.Series:
-    """Audit-only: property presence even if struck/excluded."""
-    has_prop_any = bool(group.get("IsProperty", False).any()) or bool(group.get("HasRightsNotation", False).any())
-    prop_lines_any = group[group.get("IsProperty", False) == True]["LineText"].tolist() if "LineText" in group else []
-    return pd.Series({
-        "HasPropertyAny": bool(has_prop_any),
-        "PropertyEvidenceAny": "\n\n".join(prop_lines_any[:3]),
-    })
+    def agg_owner_any(group: pd.DataFrame) -> pd.Series:
+        """Audit-only: property presence even if struck/excluded."""
+        has_prop_any = bool(group.get("IsProperty", False).any()) or bool(group.get("HasRightsNotation", False).any())
+        prop_lines_any = group[group.get("IsProperty", False) == True]["LineText"].tolist() if "LineText" in group else []
+        return pd.Series({
+            "HasPropertyAny": bool(has_prop_any),
+            "PropertyEvidenceAny": "\n\n".join(prop_lines_any[:3]),
+        })
 
     owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner).reset_index() if not inc.empty else pd.DataFrame(columns=["OwnerRecordID"])
     owner_flags_any = all_items.groupby("OwnerRecordID").apply(agg_owner_any).reset_index() if (not all_items.empty) else pd.DataFrame(columns=["OwnerRecordID"])
