@@ -53,14 +53,14 @@ TESS_TIMEOUT_SEC = 25  # hard timeout for pytesseract calls
 def _tess_image_to_string(img, config: str):
     """Wrapper around pytesseract.image_to_string with a hard timeout."""
     try:
-        return _tess_image_to_string(img, config=config, timeout=TESS_TIMEOUT_SEC)
+        return pytesseract.image_to_string(img, config=config, timeout=TESS_TIMEOUT_SEC)
     except Exception:
         return ''
 
 def _tess_image_to_data(img, config: str):
     """Wrapper around pytesseract.image_to_data with a hard timeout."""
     try:
-        return _tess_image_to_data(img, config=config, output_type=Output.DICT, timeout=TESS_TIMEOUT_SEC)
+        return pytesseract.image_to_data(img, config=config, output_type=Output.DICT, timeout=TESS_TIMEOUT_SEC)
     except Exception:
         return {'text': [], 'conf': [], 'left': [], 'top': [], 'width': [], 'height': [], 'line_num': [], 'block_num': [], 'par_num': []}
 # -----------------------------
