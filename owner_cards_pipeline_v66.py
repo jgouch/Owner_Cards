@@ -148,6 +148,11 @@ def load_facts_sections(facts_path: str) -> List[str]:
         return []
 
 
+@lru_cache(maxsize=128)
+def _normalized_facts_sections(sections_tuple: tuple[str, ...]) -> List[Tuple[str, str]]:
+    return [(sec, normalize_section_name(sec)) for sec in sections_tuple if sec]
+
+
 def match_facts_section_from_line(line_text: str, facts_sections: List[str]) -> Tuple[str, float, str]:
     """Return (best_section, confidence, method) for a property line."""
     if not line_text or not facts_sections:
@@ -157,8 +162,7 @@ def match_facts_section_from_line(line_text: str, facts_sections: List[str]) -> 
 
     # 1) Exact substring on normalized sections
     best = ('', 0.0, '')
-    for sec in facts_sections:
-        nsec = normalize_section_name(sec)
+    for sec, nsec in _normalized_facts_sections(tuple(facts_sections)):
         if not nsec:
             continue
         if nsec in norm_line:
@@ -174,8 +178,7 @@ def match_facts_section_from_line(line_text: str, facts_sections: List[str]) -> 
     if cand:
         best_sec = ''
         best_ratio = 0.0
-        for sec in facts_sections:
-            nsec = normalize_section_name(sec)
+        for sec, nsec in _normalized_facts_sections(tuple(facts_sections)):
             r = difflib.SequenceMatcher(None, cand, nsec).ratio()
             if r > best_ratio:
                 best_ratio = r
@@ -360,7 +363,7 @@ def save_failure_snapshots(pil_img: Image.Image, source_pdf: str, page_num: int,
     }
 
 def save_failure_snapshot(pil_img: Image.Image, source_pdf: str, page_num: int, reason: str = "NAME_MISSING") -> str:
-    """Backward-compatible: returns the HEADER path."""
+    """Backward-compatible: returns the FULL snapshot path."""
     paths = save_failure_snapshots(pil_img, source_pdf, page_num, reason=reason)
     return paths.get('Full', '')
 # -----------------------------
@@ -519,6 +522,21 @@ def find_state_match(line: str, zipm: Optional[re.Match]) -> Optional[re.Match]:
         for m in reversed(matches):
             if m.end() <= zipm.start():
                 return m
+    # Avoid false positives for "IN" as a preposition when no ZIP is present.
+    if not zipm:
+        filtered = []
+        for m in matches:
+            if m.group(0).upper() != "IN":
+                filtered.append(m)
+                continue
+            if re.search(r"\d", line or ""):
+                filtered.append(m)
+                continue
+            if re.search(r"\b(?:ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|LN|LANE|CT|COURT|BLVD|BOULEVARD|HWY|HIGHWAY|PKWY|PARKWAY|CIR|CIRCLE|PL|PLACE|WAY|TRL|TRAIL|TER|TERRACE)\b", line or "", flags=re.IGNORECASE):
+                filtered.append(m)
+        if filtered:
+            return filtered[-1]
+        return None
     return matches[-1]
 
 def fix_state_ocr_tokens(line: str) -> str:
