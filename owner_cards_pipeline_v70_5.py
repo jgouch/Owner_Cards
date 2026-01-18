@@ -69,6 +69,13 @@ def _tess_image_to_data(img, config: str):
     except Exception:
         return {'text': [], 'conf': [], 'left': [], 'top': [], 'width': [], 'height': [], 'line_num': [], 'block_num': [], 'par_num': []}
 
+def _tess_image_to_osd(img) -> str:
+    """pytesseract.image_to_osd with a hard timeout"""
+    try:
+        return pytesseract.image_to_osd(img, timeout=TESS_TIMEOUT_SEC)
+    except Exception:
+        return ''
+
 # -----------------------------
 # AUTO-RUN HELPERS (drag/drop friendly)
 # -----------------------------
@@ -221,7 +228,7 @@ def match_facts_section_from_line(line_text: str, facts_sections: List[str]) -> 
     return best
 
 
-def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page_num: int, dpi: int, pil_page: Optional[Image.Image] = None, facts_sections: Optional[List[str]] = None, facts_mode: str = '') -> Dict:
+def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page_num: int, dpi: int, pil_page: Optional[Image.Image] = None, facts_sections: Optional[List[str]] = None, facts_mode: str = '', reader: Optional[PdfReader] = None) -> Dict:
     """Adds NeedsReview + NeedsReviewNotes + snapshot paths; validates property sections against FaCTS."""
     notes: List[str] = []
     needs_review = False
@@ -250,7 +257,7 @@ def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page
         if not ln:
             return False
         uln = (ln or '').upper()
-        if (('LOT' in uln) or ('SEC' in uln) or ('SECTION' in uln) or ('SP' in uln) or ('SPACE' in uln) or ('GARDEN' in uln)):
+        if (('LOT' in uln) or ('SEC' in uln) or ('SECTION' in uln) or re.search(r"\bSP\b", uln) or ('SPACE' in uln) or ('GARDEN' in uln)):
             return True
         if ln.count(':') >= 2:
             return True
@@ -299,7 +306,7 @@ def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page
             if pil_page is None:
                 pil_page = render_page(pdf_path, page_num - 1, dpi=dpi)
             if pil_page is not None:
-                paths = save_failure_snapshots(pil_page, pdf_path, page_num, reason=(notes[0] if notes else 'NEEDS_REVIEW'))
+                paths = save_failure_snapshots(pil_page, pdf_path, page_num, reason=(notes[0] if notes else 'NEEDS_REVIEW'), reader=reader)
                 owner['SnapshotFull'] = paths.get('Full', '')
                 owner['SnapshotHeader'] = paths.get('Header', '')
                 owner['SnapshotItems'] = paths.get('Items', '')
@@ -350,10 +357,10 @@ def score_header_text(txt: str) -> int:
     return score
 
 
-def _apply_pdf_rotate_metadata(pil_img: Image.Image, source_pdf: str, page_index: int) -> Image.Image:
+def _apply_pdf_rotate_metadata(pil_img: Image.Image, source_pdf: str, page_index: int, reader: Optional[PdfReader] = None) -> Image.Image:
     """Apply PDF /Rotate metadata if present so snapshots match viewer orientation."""
     try:
-        r = PdfReader(source_pdf)
+        r = reader if reader is not None else PdfReader(source_pdf)
         rot = int(r.pages[page_index].get("/Rotate") or 0) % 360
         if rot in (90, 180, 270):
             return pil_img.rotate(360 - rot, expand=True)
@@ -378,7 +385,7 @@ def _osd_rotate_header(pil_img: Image.Image, header_ratio: float = 0.35) -> tupl
         except Exception:
             header_pp = header.convert("L")
 
-        osd = pytesseract.image_to_osd(header_pp)
+        osd = _tess_image_to_osd(header_pp)
         m_rot = re.search(r"Rotate:\s*(\d+)", osd)
         m_conf = re.search(r"Orientation confidence:\s*(\d+)", osd)
         rot = int(m_rot.group(1)) if m_rot else 0
@@ -445,13 +452,13 @@ def _auto_rotate_by_header_score(pil_img: Image.Image, header_ratio: float = 0.3
     return best_img, {"angle": 0, "score": best_sc, "method": "bruteforce_0"}
 
 
-def save_failure_snapshots(pil_img: Image.Image, source_pdf: str, page_num: int, reason: str = "NEEDS_REVIEW") -> Dict[str, str]:
+def save_failure_snapshots(pil_img: Image.Image, source_pdf: str, page_num: int, reason: str = "NEEDS_REVIEW", reader: Optional[PdfReader] = None) -> Dict[str, str]:
     """Save FULL + HEADER + ITEMS snapshots (auto-rotated) for manual verification."""
     _ensure_dir(FAILED_SNAPSHOT_DIR)
 
     # 0) Apply PDF /Rotate metadata so snapshots match viewer orientation
     page_index = max(0, int(page_num) - 1)
-    snap = _apply_pdf_rotate_metadata(pil_img, source_pdf, page_index)
+    snap = _apply_pdf_rotate_metadata(pil_img, source_pdf, page_index, reader=reader)
 
     # 1) Auto-rotate for readability (conservative)
     rot_img, meta = _auto_rotate_by_header_score(snap, header_ratio=0.35)
@@ -2076,7 +2083,7 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
                 "HeaderOCRUsedKraken": bool(owner_header_meta.get('kraken')) if isinstance(owner_header_meta, dict) else False,
             }
             owner.update(phone_fields)
-            owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=None, facts_sections=facts_sections, facts_mode=facts_mode)
+            owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=None, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader)
             return owner, items, is_interment
 
     # OCR FALLBACK (full)
@@ -2153,7 +2160,7 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
         "HeaderOCRUsedKraken": bool(header_meta.get('kraken')) if isinstance(header_meta, dict) else False,
     }
     owner.update(phone_fields)
-    owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=pil_original, facts_sections=facts_sections, facts_mode=facts_mode)
+    owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=pil_original, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader)
     return owner, items, is_interment
 
 
@@ -2257,7 +2264,10 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
     try:
         page_count = pdfinfo_from_path(pdf_path)["Pages"]
     except Exception:
-        page_count = len(reader.pages) if reader is not None else len(convert_from_path(pdf_path, dpi=50))
+        if reader is None:
+            print("Error: Unable to read PDF metadata for page count.")
+            return
+        page_count = len(reader.pages)
 
     owners_rows: List[Dict] = []
     items_rows: List[Dict] = []
