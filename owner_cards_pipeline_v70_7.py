@@ -45,6 +45,12 @@ import pytesseract
 from pytesseract import Output
 
 
+DEBUG_LOG = os.getenv("OWNERCARDS_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
+def _debug_log(msg: str) -> None:
+    if DEBUG_LOG:
+        print(f"[owner_cards_pipeline] {msg}")
+
 
 
 # --- OCR safety: prevent hangs (v70.7) ---
@@ -1358,6 +1364,9 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
     if not line:
         return None
     line2 = fix_state_ocr_tokens(line)
+    # Strip common labels that can block street-start detection
+    line2 = re.sub(r"^\s*(address|addr|mailing address)\s*[:\-]\s*", "", line2, flags=re.IGNORECASE)
+    line2 = line2.lstrip(" ,")
     zipm = re.search(ZIP_RE, line2)
     statem = find_state_match(line2, zipm)
     if not zipm or not statem:
@@ -1439,6 +1448,7 @@ def parse_best_address(lines: List[str]) -> Dict:
                     "Inline": True,
                 })
                 continue
+            _debug_log(f"Inline address parse failed for line {i}: {line}")
 
             prev_idx = i - 1
             street_candidate = lines[prev_idx] if prev_idx >= 0 else ""
@@ -1481,8 +1491,6 @@ def parse_best_address(lines: List[str]) -> Dict:
     if not candidates:
         for i, line in enumerate(lines[:40]):
             u = (line or '').upper()
-            if not any(city in u for city in CITY_BLOCKLIST):
-                continue
             m_state = re.search(US_STATE_RE, u, re.IGNORECASE)
             if not m_state:
                 continue
@@ -1492,6 +1500,12 @@ def parse_best_address(lines: List[str]) -> Dict:
                 if city_name in u:
                     city = city_name.title()
                     break
+            if not city:
+                city_part = normalize_ws(line[:m_state.start()]).replace(",", "")
+                if city_part and any(ch.isalpha() for ch in city_part) and not any(ch.isdigit() for ch in city_part):
+                    city = city_part.title()
+            if not city:
+                continue
             prev_idx = i - 1
             street = lines[prev_idx] if prev_idx >= 0 else ''
             street = clean_address_line(street)
