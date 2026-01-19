@@ -197,19 +197,28 @@ def load_facts_sections(facts_path: str) -> List[str]:
         return []
 
 
-def match_facts_section_from_line(line_text: str, facts_sections: List[str]) -> Tuple[str, float, str]:
+def build_facts_section_index(facts_sections: List[str]) -> List[Tuple[str, str]]:
+    """Precompute normalized section names for faster matching."""
+    out = []
+    for sec in facts_sections or []:
+        nsec = normalize_section_name(sec)
+        if not nsec:
+            continue
+        out.append((sec, nsec))
+    return out
+
+
+def match_facts_section_from_line(line_text: str, facts_sections: List[str], facts_index: Optional[List[Tuple[str, str]]] = None) -> Tuple[str, float, str]:
     """Return (best_section, confidence, method) for a property line."""
     if not line_text or not facts_sections:
         return ('', 0.0, '')
 
     norm_line = normalize_section_name(line_text)
+    idx = facts_index if facts_index is not None else build_facts_section_index(facts_sections)
 
     # 1) Exact substring on normalized sections
     best = ('', 0.0, '')
-    for sec in facts_sections:
-        nsec = normalize_section_name(sec)
-        if not nsec:
-            continue
+    for sec, nsec in idx:
         if nsec in norm_line:
             return (sec, 1.0, 'exact')
 
@@ -225,10 +234,7 @@ def match_facts_section_from_line(line_text: str, facts_sections: List[str]) -> 
         best_ratio = 0.0
         cand_u = cand
 
-        for sec in facts_sections:
-            nsec = normalize_section_name(sec)
-            if not nsec:
-                continue
+        for sec, nsec in idx:
 
             # Containment wins: e.g., cand='GRACE' and nsec='GARDEN OF GRACE'
             if (cand_u in nsec) or (nsec in cand_u):
@@ -266,7 +272,7 @@ def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page
 
     addr_evidence = False
     if street.strip() or city.strip() or addr_raw.strip():
-        blob = f"{street} {city} {addr_raw}"
+        blob = normalize_ws(f"{street} {city} {addr_raw}")
         if re.search(ZIP_RE, blob):
             addr_evidence = True
         elif re.search(US_STATE_RE, blob, re.IGNORECASE):
@@ -322,9 +328,10 @@ def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page
     unmatched_lines = []
 
     if property_lines_for_validation:
+        facts_index = build_facts_section_index(facts_sections) if facts_sections else []
         if facts_sections:
             for ln in property_lines_for_validation:
-                sec, conf, method = match_facts_section_from_line(ln, facts_sections)
+                sec, conf, method = match_facts_section_from_line(ln, facts_sections, facts_index=facts_index)
                 if sec:
                     matched_sections.append(sec)
                 else:
@@ -904,6 +911,12 @@ def _strip_phone_extension(raw: str) -> str:
     parts = re.split(r"\s*(?:ext\.?|x)\s*\d{1,6}\b", raw, maxsplit=1, flags=re.IGNORECASE)
     return parts[0]
 
+def _extract_phone_extension(raw: str) -> str:
+    if not raw:
+        return ""
+    m = re.search(r"\b(?:ext\.?|x)\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
 def _normalize_phone_digits(d: str) -> Tuple[str, bool, bool]:
     d = d or ""
     if len(d) == 11 and d.startswith("1"):
@@ -929,6 +942,7 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
     candidates = []
     for raw in matches:
         raw_main = _strip_phone_extension(raw)
+        ext = _extract_phone_extension(raw)
         d = _digits_only(raw_main)
         # v65: detect and fix fused ZIP+phone patterns
         if len(d) == 10 and zip_tails and d[:3] in zip_tails:
@@ -955,13 +969,13 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
         seen.add(d)
         norm, has_area, valid = _normalize_phone_digits(d)
         if valid:
-            candidates.append((raw, norm, has_area))
+            candidates.append((raw, norm, has_area, ext))
 
     ten = [c for c in candidates if c[2] is True]
     sev = [c for c in candidates if c[2] is False]
 
-    primary = ("", "", False)
-    alt = ("", "", False)
+    primary = ("", "", False, "")
+    alt = ("", "", False, "")
     if ten:
         primary = ten[0]
         rest = [c for c in candidates if c[1] and c[1] != primary[1]]
@@ -978,6 +992,8 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
         "Phone": primary[1] if primary[1] else "",
         "PhoneNormalized": primary[1] if primary[1] else "",
         "PhoneAltNormalized": alt[1] if alt[1] else "",
+        "PhoneExtension": primary[3] if primary[1] else "",
+        "PhoneAltExtension": alt[3] if alt[1] else "",
         "PhoneHasAreaCode": bool(primary[2]) if primary[1] else False,
         "PhoneAltHasAreaCode": bool(alt[2]) if alt[1] else False,
         "PhoneValid": bool(primary[1]) if primary[1] else False,
@@ -1466,7 +1482,7 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
         "City": city,
         "State": st,
         "ZIP": z,
-        "CityStateZip": line,
+        "CityStateZip": line2,
         "Inline": True,
     }
 
@@ -1551,7 +1567,7 @@ def parse_best_address(lines: List[str]) -> Dict:
             prev_idx = i - 1
             street = lines[prev_idx] if prev_idx >= 0 else ''
             street = clean_address_line(street)
-            candidates.append({'Index': i, 'Street': street, 'City': city, 'State': st, 'ZIP': '', 'CityStateZip': line, 'Score': 45, 'Inline': True})
+            candidates.append({'Index': i, 'Street': street, 'City': city, 'State': st, 'ZIP': '', 'CityStateZip': line, 'Score': 45, 'Inline': False})
             break
     # --- OPTIONAL: street-only fallback (when ZIP/state is missing) ---
     # If we couldn't find any ZIP+state anchored candidates, try to at least capture a street line.
