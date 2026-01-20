@@ -1,0 +1,2797 @@
+#!/usr/bin/env python3
+"""Owner Card Pipeline — v70.10 (FaCTS Section Validation + Full Snapshots + NeedsReviewNotes)
+
+This version implements the issues you identified:
+1) Strikethrough detection parity: when using PDF text layer, we now run a quick strike-line scan.
+   - If strike lines are detected on the page, we OCR the page (data mode) to build item lines with struck flags.
+   - Owner/header/address still come from the text layer (fast + accurate), but item inclusion honors strike-through.
+2) Single-line address support: parse_best_address now handles inline "street, city ST ZIP" (same line).
+3) Phone extensions: PHONE_PATTERN now matches optional extensions (ext/x), and we strip extensions for normalization.
+
+Also includes the Py3.14 regex fix (hyphen placed at end in character class).
+
+Run:
+  python3 owner_cards_pipeline_v70_10.py
+  or
+  python3 owner_cards_pipeline_v70_10.py --pdf "B (all).pdf" --out "OwnerCards_B_Output.xlsx"
+
+Deps (Mac):
+  brew install poppler tesseract
+  pip install pandas tqdm pdf2image pytesseract pillow opencv-python PyPDF2 openpyxl xlsxwriter
+"""
+
+import argparse
+import glob
+import hashlib
+import os
+import re
+import unicodedata
+from functools import lru_cache
+from datetime import datetime
+import difflib
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+from PyPDF2 import PdfReader
+from pdf2image import convert_from_path, pdfinfo_from_path
+
+import cv2
+from PIL import Image
+import pytesseract
+from pytesseract import Output
+
+
+DEBUG_LOG = os.getenv("OWNERCARDS_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
+def _debug_log(msg: str) -> None:
+    if DEBUG_LOG:
+        print(f"[owner_cards_pipeline] {msg}")
+
+
+
+# --- OCR safety: prevent hangs (v70.10) ---
+TESS_TIMEOUT_SEC = 25  # hard timeout for pytesseract calls
+
+def _tess_image_to_string(img, config: str):
+    """pytesseract.image_to_string with a hard timeout"""
+    try:
+        return pytesseract.image_to_string(img, config=config, timeout=TESS_TIMEOUT_SEC)
+    except Exception:
+        return ''
+
+def _tess_image_to_data(img, config: str):
+    """pytesseract.image_to_data with a hard timeout"""
+    try:
+        return pytesseract.image_to_data(
+            img,
+            config=config,
+            output_type=Output.DICT,
+            timeout=TESS_TIMEOUT_SEC,
+        )
+    except Exception:
+        return {'text': [], 'conf': [], 'left': [], 'top': [], 'width': [], 'height': [], 'line_num': [], 'block_num': [], 'par_num': []}
+
+def _tess_image_to_osd(img) -> str:
+    """pytesseract.image_to_osd with a hard timeout"""
+    try:
+        return pytesseract.image_to_osd(img, timeout=TESS_TIMEOUT_SEC)
+    except Exception:
+        return ''
+
+# -----------------------------
+# AUTO-RUN HELPERS (drag/drop friendly)
+# -----------------------------
+def _auto_pick_pdf(script_dir: str) -> str:
+    env_pdf = os.getenv('OWNERCARDS_PDF', '').strip()
+    if env_pdf and os.path.exists(os.path.expanduser(env_pdf)):
+        return os.path.expanduser(env_pdf)
+    cwd_pdfs = sorted(glob.glob(os.path.join(os.getcwd(), '*.pdf')))
+    if len(cwd_pdfs) == 1:
+        return cwd_pdfs[0]
+    all_like = [f for f in cwd_pdfs if '(all' in os.path.basename(f).lower()]
+    if all_like:
+        all_like.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        return all_like[0]
+    script_pdfs = sorted(glob.glob(os.path.join(script_dir, '*.pdf')))
+    if len(script_pdfs) == 1:
+        return script_pdfs[0]
+    all_like2 = [f for f in script_pdfs if '(all' in os.path.basename(f).lower()]
+    if all_like2:
+        all_like2.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        return all_like2[0]
+    return ''
+
+
+def _auto_pick_kraken_model() -> str:
+    env_m = os.getenv('OWNERCARDS_KRAKEN_MODEL', '').strip()
+    if env_m and os.path.exists(os.path.expanduser(env_m)):
+        return os.path.expanduser(env_m)
+    base = os.path.expanduser('~/Library/Application Support/htrmopo')
+    try:
+        mcc, anym = [], []
+        for root, _, files in os.walk(base):
+            for fn in files:
+                if fn.lower().endswith('.mlmodel'):
+                    full = os.path.join(root, fn)
+                    anym.append(full)
+                    if 'mccatmus' in fn.lower():
+                        mcc.append(full)
+        if mcc:
+            mcc.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            return mcc[0]
+        if anym:
+            anym.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            return anym[0]
+    except Exception:
+        return ''
+    return ''
+
+
+def _default_out_path(pdf_path: str) -> str:
+    """Default output next to the script/batch folder (not the CWD)."""
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, base_name + '_Output.xlsx')
+
+
+# -----------------------------
+# VISUAL SNIPER HELPERS
+# -----------------------------
+FAILED_SNAPSHOT_DIR = "_Failed_Snapshots"
+
+# --- Snapshot location: keep with script/batch folder (v70.10) ---
+def _set_snapshot_dir_for_script():
+    """Force snapshots to the folder containing this .py file (batch folder)."""
+    global FAILED_SNAPSHOT_DIR
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        FAILED_SNAPSHOT_DIR = os.path.join(base_dir, '_Failed_Snapshots')
+        _ensure_dir(FAILED_SNAPSHOT_DIR)
+    except Exception:
+        pass
+
+
+# -----------------------------
+# FaCTS SECTION (Garden) VALIDATION
+# -----------------------------
+
+@lru_cache(maxsize=2048)
+def normalize_section_name(name: str) -> str:
+    if name is None:
+        return ''
+    s = str(name)
+    s = unicodedata.normalize('NFKD', s)
+    s = s.upper()
+    s = s.replace('&', ' AND ')
+    # common abbreviations
+    s = re.sub(r'\bMT\.?\b', 'MOUNT', s)
+    s = re.sub(r'\bGD\.?\b', 'GOOD', s)
+    s = re.sub(r'[^A-Z0-9 ]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def load_facts_sections(facts_path: str) -> List[str]:
+    """Load unique FaCTS Section values (Garden names) from the inventory export."""
+    if not facts_path:
+        return []
+    if not os.path.exists(facts_path):
+        return []
+    try:
+        df = pd.read_excel(facts_path, engine='openpyxl', sheet_name=0, header=2, usecols=['Section'])
+        secs = df['Section'].dropna().astype(str).str.strip()
+        secs = [s for s in secs.tolist() if s and s.lower() != 'section']
+        # unique preserving order
+        seen = set()
+        out = []
+        for s in secs:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+    except Exception:
+        return []
+
+
+def build_facts_section_index(facts_sections: List[str]) -> List[Tuple[str, str]]:
+    """Precompute normalized section names for faster matching."""
+    out = []
+    for sec in facts_sections or []:
+        nsec = normalize_section_name(sec)
+        if not nsec:
+            continue
+        out.append((sec, nsec))
+    return out
+
+
+def match_facts_section_from_line(line_text: str, facts_sections: List[str], facts_index: Optional[List[Tuple[str, str]]] = None) -> Tuple[str, float, str]:
+    """Return (best_section, confidence, method) for a property line."""
+    if not line_text or not facts_sections:
+        return ('', 0.0, '')
+
+    norm_line = normalize_section_name(line_text)
+    idx = facts_index if facts_index is not None else build_facts_section_index(facts_sections)
+
+    # 1) Exact substring on normalized sections
+    best = ('', 0.0, '')
+    for sec, nsec in idx:
+        if nsec in norm_line:
+            return (sec, 1.0, 'exact')
+
+    
+    # 1.5) Try a trailing garden token after the last ':' or '/' (common format: 153:Sp.1-2:C:Gethsemane)
+    raw_u = str(line_text or '').upper().strip()
+    m_tail = re.search(r"[:/]\s*([A-Z][A-Z \-]{3,40})\s*$", raw_u)
+    if m_tail:
+        cand2 = normalize_section_name(m_tail.group(1))
+        if cand2:
+            best_sec = ''
+            best_ratio = 0.0
+            for sec, nsec in idx:
+                # containment
+                if (cand2 in nsec) or (nsec in cand2):
+                    r = 0.86
+                else:
+                    r = difflib.SequenceMatcher(None, cand2, nsec).ratio()
+                if r > best_ratio:
+                    best_ratio = r
+                    best_sec = sec
+            if best_sec and best_ratio >= 0.72:
+                return (best_sec, float(best_ratio), 'tail_fuzzy')
+
+# 2) Try a leading garden candidate (before digits/colons)
+    m = re.match(r'^\s*([A-Z][A-Z\- ]{2,50})', norm_line)
+    cand = ''
+    if m:
+        cand = m.group(1).strip()
+        cand = re.split(r'\bLOT\b|\bSEC\b|\bSECTION\b|\bSPACE\b|\d', cand, maxsplit=1)[0].strip()
+
+    if cand:
+        best_sec = ''
+        best_ratio = 0.0
+        cand_u = cand
+
+        for sec, nsec in idx:
+
+            # Containment wins: e.g., cand='GRACE' and nsec='GARDEN OF GRACE'
+            if (cand_u in nsec) or (nsec in cand_u):
+                r = 0.86
+            else:
+                r = difflib.SequenceMatcher(None, cand_u, nsec).ratio()
+
+            if r > best_ratio:
+                best_ratio = r
+                best_sec = sec
+
+        if best_sec:
+            short_cand = (len(cand_u.split()) <= 2 and len(cand_u) <= 12)
+            if best_ratio >= (0.72 if short_cand else 0.80):
+                return (best_sec, float(best_ratio), 'fuzzy')
+
+    return best
+
+
+def enrich_owner_with_review(owner: Dict, items: List[Dict], pdf_path: str, page_num: int, dpi: int, pil_page: Optional[Image.Image] = None, facts_sections: Optional[List[str]] = None, facts_mode: str = '', reader: Optional[PdfReader] = None) -> Dict:
+    """Adds NeedsReview + NeedsReviewNotes + snapshot paths; validates property sections against FaCTS."""
+    notes: List[str] = []
+    needs_review = False
+
+    prim = str(owner.get('PrimaryOwnerName', '') or '')
+    if '[MISSING' in prim.upper():
+        needs_review = True
+        notes.append('NAME_MISSING')
+
+    # Address completeness
+    # v70.10: only flag missing State/ZIP when we have evidence we're looking at a mailing address.
+    street = str(owner.get('Street', '') or '')
+    city = str(owner.get('City', '') or '')
+    addr_raw = str(owner.get('AddressRaw', '') or '')
+
+    addr_evidence = False
+    street_ok = bool(street.strip()) and bool(re.search(STREET_START_RE, street))
+    city_ok = bool(city.strip())
+    raw_ok = bool(addr_raw.strip())
+    if street_ok or city_ok or raw_ok:
+        blob = normalize_ws(f"{street} {city} {addr_raw}")
+        if re.search(ZIP_RE, blob):
+            addr_evidence = True
+        elif re.search(US_STATE_RE, blob, re.IGNORECASE):
+            addr_evidence = True
+        elif re.search(r"\bPO\s*BOX\b", blob, re.IGNORECASE):
+            addr_evidence = True
+        elif re.search(STREET_START_RE, blob):
+            addr_evidence = True
+
+    if addr_evidence and (not owner.get('State') or not owner.get('ZIP')):
+        needs_review = True
+        notes.append('ADDR_STATE_ZIP_MISSING')
+
+    # Property section validation
+    property_lines = []
+    for it in (items or []):
+        try:
+            if it.get('IsProperty') or (it.get('RightsNotation') or ''):
+                property_lines.append(it.get('LineText', '') or '')
+        except Exception:
+            continue
+
+    # v70.10: Only validate FaCTS sections on lines that actually look like they contain garden/lot/sec/space patterns.
+    def _facts_candidate_line(ln: str) -> bool:
+        if not ln:
+            return False
+        uln = (ln or '').upper()
+
+        # Strong signals: explicit garden names or structured coordinates
+        try:
+            if RE_GARDEN_CHECK.search(ln):
+                return True
+        except Exception:
+            pass
+
+        if ln.count(':') >= 2:
+            return True
+
+        # Lot/Section references are meaningful even if garden is missing
+        if ('LOT' in uln) or ('SEC' in uln) or ('SECTION' in uln):
+            return True
+
+        # 'SP'/'SPACE' alone is too weak for FaCTS validation; require another anchor
+        has_sp = bool(re.search(r"\bSP\b", uln)) or ('SPACE' in uln)
+        if has_sp and (('LOT' in uln) or ('SEC' in uln) or ('SECTION' in uln) or ln.count(':') >= 2):
+            return True
+
+        return False
+
+    property_lines_for_validation = [ln for ln in property_lines if _facts_candidate_line(ln)]
+
+    matched_sections = []
+    unmatched_lines = []
+
+    if property_lines_for_validation:
+        facts_index = build_facts_section_index(facts_sections) if facts_sections else []
+        if facts_sections:
+            for ln in property_lines_for_validation:
+                sec, conf, method = match_facts_section_from_line(ln, facts_sections, facts_index=facts_index)
+                if sec:
+                    matched_sections.append(sec)
+                else:
+                    unmatched_lines.append(ln)
+
+            if unmatched_lines and not matched_sections:
+                needs_review = True
+                notes.append(f'PROPERTY_SECTION_NO_MATCH_{len(unmatched_lines)}')
+            elif unmatched_lines:
+                notes.append(f'PROPERTY_SECTION_PARTIAL_{len(matched_sections)}of{len(property_lines_for_validation)}')
+        else:
+            if facts_mode and str(facts_mode).strip().lower() not in ('', 'not_provided', 'not provided'):
+                notes.append('FACTS_SECTIONS_NOT_LOADED')
+
+    if matched_sections:
+        owner['FaCTS_SectionMatches'] = '; '.join(sorted(set(matched_sections)))
+    else:
+        owner['FaCTS_SectionMatches'] = ''
+
+    owner['FaCTS_Mode'] = facts_mode or ''
+    owner['NeedsReview'] = bool(needs_review)
+    owner['NeedsReviewNotes'] = ' | '.join(notes)
+
+    # Snapshots when review is needed (name missing or property mismatch)
+    if needs_review:
+        try:
+            if pil_page is None:
+                pil_page = render_page(pdf_path, page_num - 1, dpi=dpi)
+            if pil_page is not None:
+                paths = save_failure_snapshots(pil_page, pdf_path, page_num, reason=(notes[0] if notes else 'NEEDS_REVIEW'), reader=reader)
+                owner['SnapshotFull'] = paths.get('Full', '')
+                owner['SnapshotHeader'] = paths.get('Header', '')
+                owner['SnapshotItems'] = paths.get('Items', '')
+                owner['SnapshotRotate'] = paths.get('Rotate', '')
+                owner['SnapshotRotateScore'] = paths.get('RotateScore', '')
+        except Exception:
+            pass
+    else:
+        owner['SnapshotFull'] = ''
+        owner['SnapshotHeader'] = ''
+        owner['SnapshotItems'] = ''
+        owner['SnapshotRotate'] = ''
+        owner['SnapshotRotateScore'] = ''
+
+    return owner
+
+
+def _ensure_dir(p: str):
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+
+
+def score_header_text(txt: str) -> int:
+    """Score OCR text for how much it looks like an owner header (name/address/zip/phone)."""
+    if not txt:
+        return 0
+    u = (txt or '').upper()
+    score = 0
+    # ZIP is a strong signal
+    if re.search(ZIP_RE, u):
+        score += 50
+    # State is a good signal
+    if re.search(US_STATE_RE, u, re.IGNORECASE):
+        score += 25
+    # Phone
+    if PHONE_PATTERN.search(txt):
+        score += 20
+    # A plausible last-name, first-name pattern in first line
+    top3 = split_lines(txt)[:3]
+    first = top3[0] if top3 else ''
+    if re.search(r"^[A-Z][A-Z\'\- ]+,\s*[A-Z]", first):
+        score += 25
+    # Reward non-gibberish lines
+    good_lines = [ln for ln in split_lines(txt) if ln and not is_gibberish(ln)]
+    score += min(len(good_lines), 40)
+    return score
+
+
+def _apply_pdf_rotate_metadata(pil_img: Image.Image, source_pdf: str, page_index: int, reader: Optional[PdfReader] = None) -> Image.Image:
+    """Apply PDF /Rotate metadata if present so snapshots match viewer orientation."""
+    try:
+        r = reader if reader is not None else PdfReader(source_pdf)
+        rot = int(r.pages[page_index].get("/Rotate") or 0) % 360
+        if rot in (90, 180, 270):
+            return pil_img.rotate(360 - rot, expand=True)
+    except Exception:
+        pass
+    return pil_img
+
+
+def _osd_rotate_header(pil_img: Image.Image, header_ratio: float = 0.35) -> tuple[Optional[Image.Image], dict]:
+    """
+    Try Tesseract OSD on header region only.
+    Returns (rotated_image or None if no reliable OSD, meta dict)
+    """
+    meta = {"method": "osd", "rotate": 0, "conf": 0}
+    try:
+        w, h = pil_img.size
+        header = pil_img.crop((0, 0, w, int(h * header_ratio)))
+
+        # Shadow-corrected header tends to help OSD on yellowed cards
+        try:
+            header_pp = preprocess_shadow_correct(header)
+        except Exception:
+            header_pp = header.convert("L")
+
+        osd = _tess_image_to_osd(header_pp)
+        m_rot = re.search(r"Rotate:\s*(\d+)", osd)
+        m_conf = re.search(r"Orientation confidence:\s*(\d+)", osd)
+        rot = int(m_rot.group(1)) if m_rot else 0
+        conf = int(m_conf.group(1)) if m_conf else 0
+        meta["rotate"] = rot % 360
+        meta["conf"] = conf
+
+        # Only trust OSD when confidence is non-trivial
+        if rot in (90, 180, 270) and conf >= 5:
+            return pil_img.rotate(360 - rot, expand=True), meta
+    except Exception:
+        pass
+    return None, meta
+
+
+def _auto_rotate_by_header_score(pil_img: Image.Image, header_ratio: float = 0.35) -> tuple[Image.Image, dict]:
+    """
+    Robust snapshot rotation:
+      1) OSD on header if confident
+      2) brute-force 0/90/180/270, score header OCR
+      3) Only rotate if best is clearly better; else keep 0°
+    """
+    # 1) OSD attempt
+    osd_img, osd_meta = _osd_rotate_header(pil_img, header_ratio=header_ratio)
+    if osd_img is not None:
+        return osd_img, {"angle": osd_meta["rotate"], "score": "osd", "method": "osd", "osd_conf": osd_meta["conf"]}
+
+    # 2) Brute-force scoring
+    cands = []
+    for angle in (0, 90, 180, 270):
+        try:
+            cand = pil_img.rotate(angle, expand=True) if angle else pil_img
+            w, h = cand.size
+            header = cand.crop((0, 0, w, int(h * header_ratio)))
+
+            try:
+                header_pp = preprocess_shadow_correct(header)
+            except Exception:
+                header_pp = header.convert("L")
+
+            txt = _tess_image_to_string(header_pp, config="--oem 3 -l eng --psm 6")
+            sc = score_header_text(txt)
+            ratio = w / max(h, 1)
+            cands.append((sc, ratio, angle, cand))
+        except Exception:
+            continue
+
+    if not cands:
+        return pil_img, {"angle": 0, "score": 0, "method": "none"}
+
+    cands.sort(key=lambda x: (x[0], x[1], -x[2]), reverse=True)
+    best_sc, best_ratio, best_angle, best_img = cands[0]
+    second_sc = cands[1][0] if len(cands) > 1 else -999
+
+    # 3) Confidence gating: only rotate if "clearly better"
+    MIN_SCORE_TO_ROTATE = 55
+    MIN_MARGIN = 8
+
+    if best_angle != 0:
+        if best_sc < MIN_SCORE_TO_ROTATE or (best_sc - second_sc) < MIN_MARGIN:
+            return pil_img, {"angle": 0, "score": best_sc, "method": "bruteforce_not_confident"}
+        return best_img, {"angle": best_angle, "score": best_sc, "method": "bruteforce_confident"}
+
+    return best_img, {"angle": 0, "score": best_sc, "method": "bruteforce_0"}
+
+
+def save_failure_snapshots(pil_img: Image.Image, source_pdf: str, page_num: int, reason: str = "NEEDS_REVIEW", reader: Optional[PdfReader] = None) -> Dict[str, str]:
+    """Save FULL + HEADER + ITEMS snapshots (auto-rotated) for manual verification."""
+    _ensure_dir(FAILED_SNAPSHOT_DIR)
+
+    # 0) Apply PDF /Rotate metadata so snapshots match viewer orientation
+    page_index = max(0, int(page_num) - 1)
+    snap = _apply_pdf_rotate_metadata(pil_img, source_pdf, page_index, reader=reader)
+
+    # 1) Auto-rotate for readability (conservative)
+    rot_img, meta = _auto_rotate_by_header_score(snap, header_ratio=0.35)
+
+    base = os.path.splitext(os.path.basename(source_pdf))[0]
+    safe_reason = re.sub(r"[^A-Za-z0-9_]+", "_", reason)[:50] if reason else "REVIEW"
+
+    w, h = rot_img.size
+    header_h = int(h * 0.35)
+    items_y = int(h * 0.33)
+
+    full_name = f"FAIL_{base}_P{page_num:04d}_{safe_reason}_FULL.jpg"
+    header_name = f"FAIL_{base}_P{page_num:04d}_{safe_reason}_HEADER.jpg"
+    items_name = f"FAIL_{base}_P{page_num:04d}_{safe_reason}_ITEMS.jpg"
+
+    full_path = os.path.join(FAILED_SNAPSHOT_DIR, full_name)
+    header_path = os.path.join(FAILED_SNAPSHOT_DIR, header_name)
+    items_path = os.path.join(FAILED_SNAPSHOT_DIR, items_name)
+
+    try:
+        rot_img.save(full_path, quality=92)
+    except Exception:
+        rot_img.convert('RGB').save(full_path, quality=92)
+
+    try:
+        rot_img.crop((0, 0, w, header_h)).save(header_path, quality=92)
+    except Exception:
+        rot_img.crop((0, 0, w, header_h)).convert('RGB').save(header_path, quality=92)
+
+    try:
+        rot_img.crop((0, items_y, w, h)).save(items_path, quality=92)
+    except Exception:
+        rot_img.crop((0, items_y, w, h)).convert('RGB').save(items_path, quality=92)
+
+    return {
+        "Full": full_path,
+        "Header": header_path,
+        "Items": items_path,
+        "Rotate": str(meta.get('angle', 0)),
+        "RotateScore": str(meta.get('score', 0)),
+        "Reason": reason or ''
+    }
+
+
+def save_failure_snapshot(pil_img: Image.Image, source_pdf: str, page_num: int, reason: str = "NAME_MISSING") -> str:
+    """Backward-compatible: returns the HEADER path."""
+    paths = save_failure_snapshots(pil_img, source_pdf, page_num, reason=reason)
+    return paths.get('Header', '')
+# -----------------------------
+# CONFIG
+# -----------------------------
+
+STATE_MAP = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR", "CALIFORNIA": "CA",
+    "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE", "FLORIDA": "FL", "GEORGIA": "GA",
+    "HAWAII": "HI", "IDAHO": "ID", "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA",
+    "KANSAS": "KS", "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN", "MISSISSIPPI": "MS",
+    "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV", "NEW HAMPSHIRE": "NH",
+    "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY", "NORTH CAROLINA": "NC",
+    "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK", "OREGON": "OR", "PENNSYLVANIA": "PA",
+    "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC", "SOUTH DAKOTA": "SD", "TENNESSEE": "TN",
+    "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA",
+    "WEST VIRGINIA": "WV", "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
+    # common TN typos only (conservative)
+    "TENN": "TN", "TENNESSES": "TN", "TEN": "TN", "TENN.": "TN", "TN.": "TN", "TIN": "TN",
+    # explicitly keep IN as IN
+    "IN": "IN",
+}
+
+CITY_BLOCKLIST = [
+    "NASHVILLE", "BRENTWOOD", "FRANKLIN", "MADISON", "ANTIOCH",
+    "HERMITAGE", "OLD HICKORY", "GOODLETTSVILLE", "PEGRAM",
+    "CLARKSVILLE", "MURFREESBORO", "LEBANON", "GALLATIN", "FAIRVIEW",
+    "WHITE BLUFF", "CENTERVILLE", "CHAPEL HILL",
+]
+
+US_STATE_RE = r"\b(" + "|".join(sorted(set(list(STATE_MAP.keys()) + list(STATE_MAP.values())), key=len, reverse=True)) + r")\b"
+ZIP_RE = r"\b\d{5}(?:-\d{4})?\b"
+STREET_START_RE = r"^\d+\s+(?![xX]\b)[A-Za-z]"
+STREET_SUFFIXES = {
+    "ST", "STREET", "AVE", "AVENUE", "RD", "ROAD", "DR", "DRIVE", "LN", "LANE",
+    "CT", "COURT", "BLVD", "BOULEVARD", "HWY", "HIGHWAY", "PKWY", "PARKWAY",
+    "CIR", "CIRCLE", "PL", "PLACE", "WAY", "TRL", "TRAIL", "TER", "TERRACE",
+}
+DIRECTIONAL_TOKENS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+
+NAME_BLACKLIST = [
+    r"\btransfer", r"\bsold\s+to", r"\bgiven\s+to", r"\bspaces",
+    r"\bcontract", r"\bsee\s+new", r"\bvoid",
+    r"\bcancel", r"\bdeed", r"\binterment", r"\bitem\s+description",
+    r"\bprice\b", r"\bsales\s+date", r"\bused\b",
+    r"\bdivorced\b", r"\bdeceased\b", r"\bwidow\b",
+    r"\bgarden\b", r"\bsection\b", r"\blot\b", r"\bblock\b",
+    r"\bsermon\b", r"\bchapel\b", r"\bmt\b", r"\bmountain\b",
+    r"\bsex\b", r"\bmale\b", r"\bfemale\b", r"\bgrave\b",
+]
+
+# Py3.14-safe: hyphen at end of class
+NAME_NOISE_PATTERNS = [
+    r"\btoor\b", r"\bmbo\b", r"\byoh\b", r"\bsbo\b",
+    r"^\d+[\sA-Z-]*\b",
+    r"^[;:\\.,\-*]+",
+    r"\bowner\s*id\b.*", r"\bowner\s*since\b.*",
+    r"\d+",
+]
+
+ADDRESS_BLOCKERS = [
+    r"\bpo\s*box\b", r"\bbox\b",
+    r"\broad\b", r"\brd\b", r"\bstreet\b", r"\bst\b",
+    r"\bavenue\b", r"\bave\b", r"\bdrive\b", r"\bdr\b",
+    r"\blane\b", r"\bln\b", r"\bcourt\b", r"\bct\b",
+    r"\bhighway\b", r"\bhwy\b", r"\bblvd\b", r"\bboulevard\b",
+    r"\bparkway\b", r"\bpkwy\b", r"\btrail\b", r"\btrl\b",
+    r"\bcircle\b", r"\bcir\b", r"\bplace\b", r"\bpl\b",
+]
+
+FUNERAL_PN_PATTERNS = [
+    r"\bprecoa\b.*\bpolicy\b", r"\bforethought\b.*\bpolicy\b", r"\bpn\s*insurance\b",
+    r"\bpreneed\b.*\bpolicy\b", r"\bpre-need\b.*\bpolicy\b", r"\bfuneral\b.*\bpre-need\b",
+    r"\bfuneral\b.*\bprearrange(?:ment|d)?\b", r"\bpolicy\s*#\b",
+]
+
+AT_NEED_FUNERAL_PATTERNS = [
+    r"\bhh\b.*\ban\b.*\bfuneral\b", r"\ban\b.*\bfuneral\b", r"\bat-need\b.*\bfuneral\b",
+    r"\ban\s+funeral\b", r"\bhh\s+an\s+funeral\b",
+]
+
+MEMORIAL_PATTERNS = [
+    r"\bmemorial\b", r"\bmarker\b", r"\bbronze\b", r"\bgranite\b", r"\btablet\b",
+    r"\bplaque\b", r"\bvase\b", r"\bmm\s*marker\b",
+]
+
+INTERMENT_SERVICE_PATTERNS = [
+    r"\binterment\b", r"\bopening\b", r"\bclosing\b", r"\bo/?c\b", r"\bsetting\b", r"\binstallation\b",
+]
+
+TRANSFER_CANCEL_PATTERNS = [
+    r"\bcancel(?:led|ed)?\b", r"\bvoid\b", r"\bno\s+longer\b", r"\brefunded\b", r"\btransfe?r(?:red|ed)?\b",
+]
+
+RIGHTS_NOTATION_RE = re.compile(r"\b(\d+)\s*/\s*(\d+)\b")
+
+EXCEL_SAFE_MAX = 32000
+TRUNC_SUFFIX = " …[TRUNCATED]"
+
+OCR_PSM6 = "--oem 3 -l eng --psm 6"
+OCR_PSM11 = "--oem 3 -l eng --psm 11"
+
+
+OCR_FILTER_NON_ITEMS = True
+# Region ratios (owner header is consistently in top 25–35% of page)
+HEADER_CROP_RATIO = 0.35
+ITEMS_START_RATIO = 0.33
+
+# OCR tuning
+TESS_LANG = 'eng'
+TESS_CONFIG_BASE = '--oem 3 -l eng'
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+
+def sha1_text(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def safe_upper(s: str) -> str:
+    return normalize_ws(s).upper()
+
+def compile_any(patterns: List[str]) -> List[re.Pattern]:
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
+
+def matches_any(line: str, patterns: List[re.Pattern]) -> bool:
+    return any(p.search(line or "") for p in patterns)
+
+
+# -----------------------------
+# v70.10 PROPERTY HEURISTICS (garden + coordinate OCR fuzz)
+# -----------------------------
+DEFAULT_GARDENS = [
+    "GOOD SHEPHERD",
+    "EVERLASTING LIFE",
+    "LAST SUPPER",
+    "ATONEMENT",
+    "PRAYER",
+    "GETHSEMANE",
+    "CHAPEL HILL",
+    "PEACE",
+    "FAITH",
+    "SERENITY",
+    "FOUNTAIN",
+    "CROSS",
+    "SERMON ON THE MOUNT",
+    "LAKEVIEW ESTATES",
+    "GRACE",
+    "GARDEN OF GRACE",
+]
+
+def _build_garden_re(gardens):
+    pats = []
+    for g in (gardens or []):
+        ug = safe_upper(g)
+        if not ug:
+            continue
+        toks = [re.escape(t) for t in ug.split() if t]
+        if not toks:
+            continue
+        pats.append(r"\b" + r"\s+".join(toks) + r"\b")
+    if not pats:
+        return re.compile(r"$^")
+    return re.compile(r"(?:" + "|".join(pats) + r")", re.IGNORECASE)
+
+RE_GARDEN_CHECK = _build_garden_re(DEFAULT_GARDENS)
+
+def _update_garden_regex_from_facts(facts_sections: list):
+    """Expand garden regex using DEFAULT_GARDENS plus FaCTS sections (if provided)."""
+    global RE_GARDEN_CHECK
+    try:
+        extra = [s for s in (facts_sections or []) if isinstance(s, str) and s.strip()]
+        gardens = list(DEFAULT_GARDENS) + extra
+        RE_GARDEN_CHECK = _build_garden_re(gardens)
+    except Exception:
+        pass
+
+
+COORD_OCR_FUZZ_RE = re.compile(
+    r"""
+    (?:\b\d{1,4}\s*[:/]\s*[A-Z0-9]{1,4}\s*[:/]\s*[0-9IL]\b) |   # 73:A:l or 73/A/1
+    (?:\b\d{1,4}\s*[A-Z8]\s*[0-9IL]\b) |                         # 73B1 or 7381-ish
+    (?:\b\d{1,4}\s*[A-Z8]\b\s*[0-9IL]\b)                         # 73B 1 or 738 1
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+def heuristic_is_property(line: str) -> bool:
+    """
+    v70.10: Property if either:
+      (A) coordinate/lot-space signature is strong, even without garden text, OR
+      (B) garden name present + coordinate-ish signature
+
+    This removes the hard gate that required a garden name from a small list.
+    """
+    if not line:
+        return False
+
+    u = (line or '').upper()
+    has_coord = bool(COORD_OCR_FUZZ_RE.search(u))
+    has_colon_struct = (u.count(':') + u.count('/')) >= 2
+    has_keywords = bool(re.search(r"\b(SP\.?|SPACE|LOT|SEC\.?|SECTION|BLOCK|BLK\.?|GRAVE|CRYPT|LAWN)\b", u))
+    has_garden = bool(RE_GARDEN_CHECK.search(u))
+
+    if has_coord and (has_garden or has_keywords or has_colon_struct):
+        return True
+    if has_colon_struct and (has_keywords or has_garden):
+        return True
+    if has_coord and has_colon_struct:
+        return True
+
+    if not has_garden:
+        return False
+
+    toks = re.findall(r"[A-Z0-9]+", u)
+    score = 0
+    for t in toks:
+        has_d = any(ch.isdigit() for ch in t)
+        has_a = any(ch.isalpha() for ch in t)
+        if has_d and has_a:
+            score += 2
+        elif has_d and len(t) <= 4:
+            score += 1
+    return score >= 3
+
+RE_FUNERAL_PN = compile_any(FUNERAL_PN_PATTERNS)
+RE_AT_NEED = compile_any(AT_NEED_FUNERAL_PATTERNS)
+RE_MEMORIAL = compile_any(MEMORIAL_PATTERNS)
+RE_INTERMENT = compile_any(INTERMENT_SERVICE_PATTERNS)
+RE_XFER = compile_any(TRANSFER_CANCEL_PATTERNS)
+RE_NAME_BLACKLIST = compile_any(NAME_BLACKLIST)
+RE_NAME_NOISE = compile_any(NAME_NOISE_PATTERNS)
+RE_ADDR_BLOCK = compile_any(ADDRESS_BLOCKERS)
+RE_NAME_GEO = compile_any([r"\bSermon\b", r"\bChapel\b", r"\bGarden\b", r"\bSection\b", r"\bMount\b", r"\bMt\.?\b"])
+RE_NAME_GENDER = compile_any([r"\bSex\b", r"\bMale\b", r"\bFemale\b", r"\bGrave\b"])
+
+
+def normalize_state(st: str) -> str:
+    if not st:
+        return ""
+    st_clean = st.upper().replace(".", "").strip()
+    return STATE_MAP.get(st_clean, st_clean)
+
+def find_state_match(line: str, zipm: Optional[re.Match]) -> Optional[re.Match]:
+    matches = list(re.finditer(US_STATE_RE, line or "", flags=re.IGNORECASE))
+    if not matches:
+        return None
+    if zipm:
+        for m in reversed(matches):
+            if m.end() <= zipm.start():
+                return m
+    return matches[-1]
+
+def fix_state_ocr_tokens(line: str) -> str:
+    """
+    Conservative OCR repair for state tokens.
+    Only fixes patterns that are extremely unlikely to be valid US states.
+    """
+    if not line:
+        return line
+    # Common OCR: '1N' for 'TN' (digit one)
+    line = re.sub(r"\b1N\b", "TN", line, flags=re.IGNORECASE)
+    # Optional: lowercase ell 'lN' occasionally appears for TN
+    line = re.sub(r"\blN\b", "TN", line, flags=re.IGNORECASE)
+    return line
+
+def extract_zip_state(line: str) -> Tuple[Optional[str], Optional[str]]:
+    line2 = fix_state_ocr_tokens(line or "")
+    zipm = re.search(ZIP_RE, line2)
+    statem = find_state_match(line2, zipm)
+    found_zip = zipm.group(0) if zipm else None
+    found_state = normalize_state(statem.group(0)) if statem else None
+    return found_zip, found_state
+
+def looks_like_address_line(line: str) -> bool:
+    if not line:
+        return False
+    z, st = extract_zip_state(line)
+    if z and st:
+        return True
+    return matches_any(line, RE_ADDR_BLOCK)
+
+def split_lines(raw_text: str) -> List[str]:
+    raw_text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [normalize_ws(x) for x in raw_text.split("\n")]
+    return [x for x in lines if x]
+
+
+# -----------------------------
+# INITIAL PRESERVATION
+# -----------------------------
+
+INITIAL_DIGIT_MAP = {"8": "B", "0": "O", "1": "I", "2": "Z", "5": "S", "6": "G", "9": "P"}
+
+def fix_digit_initials_in_name(line: str) -> str:
+    """Fix digit-as-initial tokens: 'Cynthia 8.' -> 'Cynthia B.'"""
+    if not line:
+        return line
+    tokens = line.split()
+    out = []
+    for i, tok in enumerate(tokens):
+        core = tok
+        trail = ""
+        while core and core[-1] in ".,;:":
+            trail = core[-1] + trail
+            core = core[:-1]
+        if len(core) == 1 and core.isdigit() and core in INITIAL_DIGIT_MAP:
+            if i > 0 and re.search(r"[A-Za-z]", tokens[i - 1]):
+                out.append(INITIAL_DIGIT_MAP[core] + (trail if trail else "."))
+                continue
+        out.append(tok)
+    return " ".join(out)
+
+def fix_leading_digit_as_letter(line: str, target_char: Optional[str]) -> str:
+    """Fix leading digit-as-letter only when it matches target char."""
+    if not line:
+        return line
+    if not line[0].isdigit():
+        return line
+    if line[0] in INITIAL_DIGIT_MAP and len(line) > 2 and line[1].isalpha():
+        repl = INITIAL_DIGIT_MAP[line[0]]
+        if (not target_char) or (repl.upper() == target_char.upper()):
+            if "," in line[:20] or line[:20].isupper():
+                return repl + line[1:]
+    return line
+
+
+# -----------------------------
+# PHONE (extensions supported)
+# -----------------------------
+
+PHONE_PATTERN = re.compile(
+    r"(?:(?:\+?1[\s\-\.]?)?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}|\b\d{3}[\s\-\.]?\d{4}\b)"
+    r"(?:\s*(?:ext\.?|x)\s*\d{1,6})?",
+    re.IGNORECASE
+)
+
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+def _strip_phone_extension(raw: str) -> str:
+    if not raw:
+        return ""
+    # Strip extensions like 'ext123', 'ext 123', 'x123', 'x 123' (case-insensitive)
+    parts = re.split(r"\s*(?:ext\.?|x)\s*\d{1,6}\b", raw, maxsplit=1, flags=re.IGNORECASE)
+    return parts[0]
+
+def _extract_phone_extension(raw: str) -> str:
+    if not raw:
+        return ""
+    m = re.search(r"\b(?:ext\.?|x)\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
+def _normalize_phone_digits(d: str) -> Tuple[str, bool, bool]:
+    d = d or ""
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) == 10:
+        return f"({d[0:3]}) {d[3:6]}-{d[6:10]}", True, True
+    if len(d) == 7:
+        return f"{d[0:3]}-{d[3:7]}", False, True
+    return "", False, False
+
+def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
+    header_text = "\n".join(lines[:18]) if lines else (full_text or "")
+    # v65: guard against false 10-digit phones formed by ZIP tail + 7-digit local number
+    zips_in_header = re.findall(ZIP_RE, header_text)
+    zip_tails = {z[-3:] for z in zips_in_header}
+    header_upper = header_text.upper()
+    allow_seven_digit = any(token in header_upper for token in ["PHONE", "TEL", "TELEPHONE"])
+    matches = [m.group(0) for m in PHONE_PATTERN.finditer(header_text)]
+    if not matches:
+        matches = [m.group(0) for m in PHONE_PATTERN.finditer(full_text or "")]
+
+    seen = set()
+    candidates = []
+    for raw in matches:
+        raw_main = _strip_phone_extension(raw)
+        ext = _extract_phone_extension(raw)
+        d = _digits_only(raw_main)
+        # v65: detect and fix fused ZIP+phone patterns
+        if len(d) == 10 and zip_tails and d[:3] in zip_tails:
+            local7 = d[3:]
+            try:
+                fused = False
+                for z in zips_in_header:
+                    if not z.endswith(d[:3]):
+                        continue
+                    if re.search(rf"{re.escape(z)}\s*(?:\n\s*)?{local7[:3]}[\s\-\.]*{local7[3:]}\b", header_text):
+                        fused = True
+                        break
+                if fused:
+                    if allow_seven_digit and len(local7) == 7:
+                        d = local7
+                    else:
+                        continue
+            except Exception:
+                pass
+        if len(d) == 7 and not allow_seven_digit:
+            continue
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        norm, has_area, valid = _normalize_phone_digits(d)
+        if valid:
+            candidates.append((raw, norm, has_area, ext))
+
+    ten = [c for c in candidates if c[2] is True]
+    sev = [c for c in candidates if c[2] is False]
+
+    primary = ("", "", False, "")
+    alt = ("", "", False, "")
+    if ten:
+        primary = ten[0]
+        rest = [c for c in candidates if c[1] and c[1] != primary[1]]
+        if rest:
+            alt = rest[0]
+    elif sev:
+        primary = sev[0]
+        rest = [c for c in candidates if c[1] and c[1] != primary[1]]
+        if rest:
+            alt = rest[0]
+
+    return {
+        "PhoneRaw": " | ".join([c[0] for c in candidates[:2]]),
+        "Phone": primary[1] if primary[1] else "",
+        "PhoneNormalized": primary[1] if primary[1] else "",
+        "PhoneAltNormalized": alt[1] if alt[1] else "",
+        "PhoneExtension": primary[3] if primary[1] else "",
+        "PhoneAltExtension": alt[3] if alt[1] else "",
+        "PhoneHasAreaCode": bool(primary[2]) if primary[1] else False,
+        "PhoneAltHasAreaCode": bool(alt[2]) if alt[1] else False,
+        "PhoneValid": bool(primary[1]) if primary[1] else False,
+        "PhoneAltValid": bool(alt[1]) if alt[1] else False,
+    }
+
+
+# -----------------------------
+# EXCEL SAFETY
+# -----------------------------
+
+def excel_safe_text(v):
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(v, (int, float, np.integer, np.floating, bool)):
+        try:
+            if isinstance(v, (float, np.floating)) and np.isinf(v):
+                return ""
+        except Exception:
+            pass
+        return v
+
+    s = str(v)
+    try:
+        s = unicodedata.normalize("NFKD", s)
+    except Exception:
+        pass
+
+    s = re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]", "", s)
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+
+    s_l = s.lstrip()
+    if s_l.startswith(("=", "+", "-", "@")):
+        s = "'" + s
+
+    if len(s) > EXCEL_SAFE_MAX:
+        s = s[: (EXCEL_SAFE_MAX - len(TRUNC_SUFFIX))] + TRUNC_SUFFIX
+    return s
+
+def make_df_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    for c in df2.columns:
+        df2[c] = df2[c].map(excel_safe_text)
+    return df2
+
+def choose_excel_engine() -> str:
+    try:
+        import xlsxwriter  # noqa
+        return "xlsxwriter"
+    except Exception:
+        return "openpyxl"
+
+def force_string_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: "" if x is None or (isinstance(x, float) and np.isnan(x)) else str(x))
+    return df
+
+
+# -----------------------------
+# TEXT LAYER
+# -----------------------------
+
+def extract_pdf_text_page(pdf_path: str, page_index: int, reader: Optional[PdfReader] = None) -> str:
+    try:
+        r = reader if reader is not None else PdfReader(pdf_path)
+        if page_index >= len(r.pages):
+            return ""
+        return r.pages[page_index].extract_text() or ""
+    except Exception:
+        return ""
+
+def text_layer_usable(txt: str) -> bool:
+    if not txt:
+        return False
+    t = normalize_ws(txt)
+    if sum(ch.isalpha() for ch in t) < 40:
+        return False
+    anchors = ["ITEM DESCRIPTION", "OWNER ID", "CONTRACT", "LOT", "SECTION", "GARDEN", "TN", "TENNESSEE"]
+    if any(a in t.upper() for a in anchors):
+        return True
+    return len(t) > 250
+
+def detect_template_type(text: str) -> str:
+    t = (text or "").upper()
+    if "INTERMENT RECORD" in t:
+        return "interment_record"
+    if "ITEM DESCRIPTION" in t or "OWNER ID" in t or "CONTRACT NBR" in t:
+        return "modern_table"
+    return "legacy_typewritten"
+
+
+# -----------------------------
+# OCR / IMAGE
+# -----------------------------
+
+def deskew_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thr > 0))
+    if coords.size == 0:
+        return img_bgr
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    angle = -(90 + angle) if angle < -45 else -angle
+    h, w = img_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+
+def dewarp_perspective(img_bgr: np.ndarray) -> np.ndarray:
+    """Best-effort perspective correction using largest 4-point contour."""
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(gray, 60, 180)
+        edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+        cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return img_bgr
+        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
+        h, w = gray.shape[:2]
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area < 0.25 * w * h:
+                continue
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) != 4:
+                continue
+            pts = approx.reshape(4, 2).astype('float32')
+            s = pts.sum(axis=1)
+            diff = np.diff(pts, axis=1).reshape(-1)
+            tl = pts[s.argmin()]
+            br = pts[s.argmax()]
+            tr = pts[diff.argmin()]
+            bl = pts[diff.argmax()]
+            src_pts = np.array([tl, tr, br, bl], dtype='float32')
+            widthA = np.linalg.norm(br - bl)
+            widthB = np.linalg.norm(tr - tl)
+            maxW = int(max(widthA, widthB))
+            heightA = np.linalg.norm(tr - br)
+            heightB = np.linalg.norm(tl - bl)
+            maxH = int(max(heightA, heightB))
+            if maxW < 100 or maxH < 100:
+                continue
+            dst_pts = np.array([[0,0],[maxW-1,0],[maxW-1,maxH-1],[0,maxH-1]], dtype='float32')
+            M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            warped = cv2.warpPerspective(img_bgr, M, (maxW, maxH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return warped
+        return img_bgr
+    except Exception:
+        return img_bgr
+def ensure_dark_text_on_white(bin_img: np.ndarray) -> np.ndarray:
+    return 255 - bin_img if np.mean(bin_img) < 127 else bin_img
+
+def preprocess_standard(pil_img: Image.Image) -> Image.Image:
+    img_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return Image.fromarray(ensure_dark_text_on_white(binary))
+
+def preprocess_clahe(pil_img: Image.Image) -> Image.Image:
+    img_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    lab = cv2.cvtColor(img_np, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(cv2.cvtColor(limg, cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2GRAY)
+    bin_img = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    return Image.fromarray(ensure_dark_text_on_white(bin_img))
+
+def preprocess_ghost(pil_img: Image.Image) -> Image.Image:
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    bin_img = ensure_dark_text_on_white(bin_img)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    bin_img = cv2.erode(bin_img, kernel, iterations=1)  # thicken faint ink strokes
+    return Image.fromarray(bin_img)
+
+
+# --- Additional preprocessing for hard scans (illumination correction + sharpening) ---
+def preprocess_shadow_correct(pil_img: Image.Image) -> Image.Image:
+    """Normalize uneven illumination/shadows to help OCR on faint scans."""
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    bg = cv2.medianBlur(gray, 31)
+    bg = np.clip(bg, 1, 255)
+    norm = cv2.divide(gray, bg, scale=255)
+    norm = cv2.bilateralFilter(norm, 9, 50, 50)
+    bin_img = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    bin_img = ensure_dark_text_on_white(bin_img)
+    return Image.fromarray(bin_img)
+
+
+def unsharp_mask(pil_img: Image.Image, amount: float = 1.2, radius: int = 1) -> Image.Image:
+    """Simple unsharp mask to strengthen faint strokes without over-bolding."""
+    img = np.array(pil_img.convert('L'))
+    blur = cv2.GaussianBlur(img, (0, 0), radius)
+    sharp = cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0)
+    sharp = np.clip(sharp, 0, 255).astype(np.uint8)
+    return Image.fromarray(sharp)
+
+
+def crop_region(pil_img: Image.Image, top: float, bottom: float) -> tuple[Image.Image, int]:
+    """Crop a vertical region [top,bottom] fractions. Returns (crop, y_offset_px)."""
+    w, h = pil_img.size
+    y1 = int(h * top)
+    y2 = int(h * bottom)
+    y2 = max(y2, y1 + 1)
+    return pil_img.crop((0, y1, w, y2)), y1
+
+
+def crop_header(pil_img: Image.Image) -> tuple[Image.Image, int]:
+    return crop_region(pil_img, 0.0, HEADER_CROP_RATIO)
+
+
+def crop_items(pil_img: Image.Image) -> tuple[Image.Image, int]:
+    return crop_region(pil_img, ITEMS_START_RATIO, 1.0)
+
+def group_text_lines_from_ocr(data: Dict) -> List[Dict]:
+    n = len(data.get("text", []))
+    words = []
+    for i in range(n):
+        txt = data["text"][i]
+        if not txt or not str(txt).strip():
+            continue
+        try:
+            conf = int(float(data["conf"][i]))
+        except Exception:
+            conf = -1
+        if 0 <= conf < 15:
+            continue
+        words.append({
+            "text": str(txt).strip(),
+            "x": int(data["left"][i]),
+            "y": int(data["top"][i]),
+            "w": int(data["width"][i]),
+            "h": int(data["height"][i]),
+            "line_num": int(data["line_num"][i]),
+            "block_num": int(data["block_num"][i]),
+            "par_num": int(data["par_num"][i]),
+        })
+
+    groups = {}
+    for w in words:
+        key = (w["block_num"], w["par_num"], w["line_num"])
+        groups.setdefault(key, []).append(w)
+
+    lines = []
+    for key, ws in groups.items():
+        ws = sorted(ws, key=lambda z: z["x"])
+        text = normalize_ws(" ".join([w["text"] for w in ws]))
+        x1 = min(w["x"] for w in ws); y1 = min(w["y"] for w in ws)
+        x2 = max(w["x"] + w["w"] for w in ws); y2 = max(w["y"] + w["h"] for w in ws)
+        lines.append({"key": key, "text": text, "bbox": (x1, y1, x2, y2)})
+
+    lines.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))
+    return lines
+
+def detect_horizontal_strikelines(img_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 15)
+    height, width = gray.shape[:2]
+    kernel_width = max(35, int(width * 0.03))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
+    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+    edges = cv2.Canny(horiz, 50, 150)
+    min_len = max(80, int(width * 0.08))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=min_len, maxLineGap=10)
+    segs: List[Tuple[int, int, int, int]] = []
+    if lines is None:
+        return segs
+    for l in lines[:, 0, :]:
+        x1, y1, x2, y2 = map(int, l)
+        if abs(y2 - y1) <= 3 and abs(x2 - x1) >= 80:
+            segs.append((x1, y1, x2, y2))
+    return segs
+
+def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple[int, int, int, int]]) -> bool:
+    """
+    Overlap-ratio strike logic:
+    Treat a line as struck ONLY when a horizontal strike segment covers a meaningful
+    portion of the line width. This prevents a small X over one number from canceling
+    the entire line.
+
+    Rule:
+      - segment must be roughly within the line's vertical band (with small tolerance)
+      - horizontal overlap fraction >= 0.35
+    """
+    if not strike_segs:
+        return False
+
+    x1, y1, x2, y2 = line_bbox
+    line_w = max(1, x2 - x1)
+
+    # allow a little vertical tolerance
+    tol = 3
+    for sx1, sy1, sx2, sy2 in strike_segs:
+        # Ensure segment is horizontal-ish and within y-band
+        if not (y1 - tol <= sy1 <= y2 + tol):
+            continue
+
+        # Normalize segment x order
+        if sx2 < sx1:
+            sx1, sx2 = sx2, sx1
+
+        # Compute overlap
+        ov = max(0, min(x2, sx2) - max(x1, sx1))
+        # mid-band check to ignore underline-style rules
+        h = max(1, y2 - y1)
+        mid_top = y1 + int(0.2 * h)
+        mid_bot = y2 - int(0.2 * h)
+        if not (mid_top <= sy1 <= mid_bot):
+            continue
+        if (ov / line_w) >= 0.45:
+            return True
+
+    return False
+
+
+def render_page(pdf_path: str, page_index: int, dpi: int) -> Optional[Image.Image]:
+    imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index + 1, last_page=page_index + 1)
+    if not imgs:
+        return None
+    return imgs[0].convert("RGB")
+
+# v65: render + deskew helper so strike-segment coordinates can be scaled to full DPI consistently
+def render_page_deskew(pdf_path: str, page_index: int, dpi: int) -> Optional[Image.Image]:
+    pil_img = render_page(pdf_path, page_index, dpi=dpi)
+    if pil_img is None:
+        return None
+    try:
+        img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        img_bgr = deskew_bgr(img_bgr)
+        return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    except Exception:
+        return pil_img
+
+
+
+def detect_strike_segs_for_page(pdf_path: str, page_index: int, dpi: int = 150) -> Tuple[List[Tuple[int, int, int, int]], Optional[Image.Image]]:
+    """Render once at the requested DPI, deskew, and return (strike_segments, deskewed_PIL_RGB).
+    Using the same render for both strike detection and OCR avoids coordinate mismatches.
+    """
+    pil_img = render_page(pdf_path, page_index, dpi=dpi)
+    if pil_img is None:
+        return [], None
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    img_bgr = deskew_bgr(img_bgr)
+    segs = detect_horizontal_strikelines(img_bgr)
+    pil_deskew = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    return segs, pil_deskew
+
+def ocr_items_with_strike_from_image(pil_img: Image.Image, strike_segs: List[Tuple[int, int, int, int]], y_min_frac: float = ITEMS_START_RATIO) -> List[Dict]:
+    """OCR a pre-rendered (and ideally deskewed) PIL image in data mode (std+clahe).
+    Uses strike_segs in the SAME coordinate space as pil_img to flag struck lines.
+    """
+    if pil_img is None:
+        return []
+    pil_std = preprocess_standard(pil_img)
+    pil_clahe = preprocess_clahe(pil_img)
+    d_std = _tess_image_to_data(pil_std, config=OCR_PSM6)
+    d_clahe = _tess_image_to_data(pil_clahe, config=OCR_PSM6)
+    raw_lines_a = group_text_lines_from_ocr(d_std)
+    raw_lines_b = group_text_lines_from_ocr(d_clahe)
+    items: List[Dict] = []
+    seen = set()
+
+    def maybe_add_line(ln_obj: Dict):
+        txt = ln_obj.get("text", "")
+        if not txt:
+            return
+        x1, y1, x2, y2 = ln_obj["bbox"]
+        try:
+            _w, _h = pil_img.size
+            if y1 < int(_h * y_min_frac):
+                return
+        except Exception:
+            pass
+        key = sha1_text(f"{normalize_ws(txt)}\n{round(x1,-1)}\n{round(y1,-1)}\n{round(x2,-1)}\n{round(y2,-1)}")
+        if key in seen:
+            return
+        struck = line_is_struck(ln_obj["bbox"], strike_segs)
+        it = item_dict_from_line(txt, struck=struck)
+        if OCR_FILTER_NON_ITEMS and not (it.get("Include") or it.get("StruckThrough") or it.get("ExcludedByText")):
+            seen.add(key)
+            return
+        items.append(it)
+        seen.add(key)
+
+    # Prefer CLAHE first then STD (often cleaner), matching prior behavior
+    for ln_obj in raw_lines_b:
+        maybe_add_line(ln_obj)
+    for ln_obj in raw_lines_a:
+        maybe_add_line(ln_obj)
+    return items
+
+def ocr_items_with_strike(pdf_path: str, page_index: int, dpi: int, strike_segs: List[Tuple[int, int, int, int]]) -> List[Dict]:
+    """Backward-compatible wrapper: render+deskew at DPI, then OCR with strike.
+    Prefer calling ocr_items_with_strike_from_image when you already have the rendered PIL.
+    """
+    pil_img = render_page(pdf_path, page_index, dpi=dpi)
+    if pil_img is None:
+        return []
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    img_bgr = deskew_bgr(img_bgr)
+    pil_deskew = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    return ocr_items_with_strike_from_image(pil_deskew, strike_segs=strike_segs)
+
+def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
+    """Parse a single-line address containing street + city + state + ZIP."""
+    if not line:
+        return None
+    line2 = fix_state_ocr_tokens(line)
+    # Strip common labels that can block street-start detection
+    line2 = re.sub(r"^\s*(address|addr|mailing address)\s*[:\-]\s*", "", line2, flags=re.IGNORECASE)
+    line2 = line2.lstrip(" ,")
+    zipm = re.search(ZIP_RE, line2)
+    statem = find_state_match(line2, zipm)
+    if not zipm or not statem:
+        return None
+    if not re.search(STREET_START_RE, line2):
+        return None
+
+    z = zipm.group(0)
+    st = normalize_state(statem.group(0))
+    before_state = normalize_ws(line2[:statem.start()].rstrip(",")).strip()
+    if not before_state:
+        return None
+
+    # split street/city
+    if "," in before_state:
+        street_part, city_part = before_state.rsplit(",", 1)
+        street = normalize_ws(street_part)
+        city = normalize_ws(city_part)
+    else:
+        # try to split by a known city ending or a street suffix marker
+        upper_before = before_state.upper()
+        city_match = None
+        for city_name in sorted(CITY_BLOCKLIST, key=len, reverse=True):
+            if upper_before.endswith(f" {city_name}"):
+                city_match = city_name
+                break
+        if city_match:
+            street = normalize_ws(before_state[: -len(city_match)].rstrip())
+            city = normalize_ws(city_match)
+        else:
+            parts = before_state.split()
+            suffix_idx = None
+            for i in range(len(parts)):
+                token = parts[i].rstrip(".").upper()
+                if token in STREET_SUFFIXES:
+                    suffix_idx = i
+            if suffix_idx is not None and suffix_idx + 1 < len(parts):
+                street_tokens = parts[: suffix_idx + 1]
+                city_tokens = parts[suffix_idx + 1 :]
+                if city_tokens and city_tokens[0].upper() in DIRECTIONAL_TOKENS:
+                    street_tokens.append(city_tokens[0])
+                    city_tokens = city_tokens[1:]
+                street = " ".join(street_tokens)
+                city = " ".join(city_tokens)
+            else:
+                if len(parts) >= 3 and parts[-1].upper() not in DIRECTIONAL_TOKENS:
+                    street = " ".join(parts[:-1])
+                    city = parts[-1]
+                else:
+                    street = before_state
+                    city = ""
+
+    return {
+        "Street": street,
+        "City": city,
+        "State": st,
+        "ZIP": z,
+        "CityStateZip": line2,
+        "Inline": True,
+    }
+
+
+def parse_best_address(lines: List[str]) -> Dict:
+    """Pick best address candidate; now supports inline address lines."""
+    candidates = []
+    for i, line in enumerate(lines):
+        z, st = extract_zip_state(line)
+        if z and st:
+            inline = parse_inline_address_line(line)
+            if inline:
+                candidates.append({
+                    "Index": i,
+                    "Street": inline["Street"],
+                    "City": inline["City"],
+                    "State": inline["State"],
+                    "ZIP": inline["ZIP"],
+                    "CityStateZip": inline["CityStateZip"],
+                    "Score": 95 if inline.get("City") else 85,
+                    "Inline": True,
+                })
+                continue
+            _debug_log(f"Inline address parse failed for line {i}: {line}")
+
+            prev_idx = i - 1
+            street_candidate = lines[prev_idx] if prev_idx >= 0 else ""
+            street_candidate = clean_address_line(street_candidate)
+            street_candidate = re.sub(r"^[\W_]+", "", street_candidate)
+
+            # v65: if the street line ends with a known city (e.g., '... Fairview') and the next line is only state+ZIP, split it
+            city_from_street = ''
+            street_candidate2 = street_candidate
+            try:
+                u_sc = (street_candidate or '').upper().strip().rstrip(',')
+                for city_name in sorted(CITY_BLOCKLIST, key=len, reverse=True):
+                    if u_sc.endswith(f' {city_name}'):
+                        city_from_street = city_name.title()
+                        street_candidate2 = normalize_ws((street_candidate or '')[: -len(city_name)]).rstrip(',').strip()
+                        break
+            except Exception:
+                pass
+
+            score = 50
+            if street_candidate and re.search(STREET_START_RE, street_candidate):
+                score += 40
+            if "," in street_candidate:
+                score -= 30
+            if len(street_candidate) < 5:
+                score -= 20
+
+            candidates.append({
+                "Index": prev_idx if prev_idx >= 0 else i,
+                "Street": street_candidate2,
+                "City": city_from_street,
+                "State": st,
+                "ZIP": z,
+                "CityStateZip": line,
+                "Score": score + (15 if city_from_street else 0),
+            })
+
+    
+    # v70.10: Loose address hunter - City + State without ZIP
+    if not candidates:
+        for i, line in enumerate(lines[:40]):
+            u = (line or '').upper()
+            m_state = re.search(US_STATE_RE, u, re.IGNORECASE)
+            if not m_state:
+                continue
+            st = normalize_state(m_state.group(0))
+            city = ''
+            for city_name in sorted(CITY_BLOCKLIST, key=len, reverse=True):
+                if city_name in u:
+                    city = city_name.title()
+                    break
+            if not city:
+                city_part = normalize_ws(line[:m_state.start()]).replace(",", "")
+                if city_part and any(ch.isalpha() for ch in city_part) and not any(ch.isdigit() for ch in city_part):
+                    city = city_part.title()
+            if not city:
+                continue
+            prev_idx = i - 1
+            street = lines[prev_idx] if prev_idx >= 0 else ''
+            street = clean_address_line(street)
+            candidates.append({'Index': i, 'Street': street, 'City': city, 'State': st, 'ZIP': '', 'CityStateZip': line, 'Score': 45, 'Inline': False})
+            break
+    # --- OPTIONAL: street-only fallback (when ZIP/state is missing) ---
+    # If we couldn't find any ZIP+state anchored candidates, try to at least capture a street line.
+    if not candidates:
+        TOP_N = 25
+        scan = lines[:TOP_N]
+
+        exclude_keywords = (
+            "OWNER ID", "OWNER SINCE", "ITEM DESCRIPTION", "CONTRACT", "USED", "SALES DATE", "PRICE",
+            "LOT", "SECTION", "SEC", "BLOCK", "SP", "SPACE", "GARDEN", "MAUS", "MAUSOLEUM",
+            "INTERMENT", "BURIAL", "DECEASED", "DOD", "DOB"
+        )
+
+        street_suffixes = {
+            "ST", "ST.", "AVE", "AVE.", "RD", "RD.", "DR", "DR.", "LN", "LN.",
+            "CT", "CT.", "BLVD", "BLVD.", "HWY", "PKWY", "CIR", "PL", "WAY", "TRL", "TER"
+        }
+
+        best = None  # (score, idx, cleaned)
+
+        for i, line in enumerate(scan):
+            ln = normalize_ws(line)
+            if not ln:
+                continue
+
+            u = ln.upper()
+            if any(k in u for k in exclude_keywords):
+                continue
+
+            if not re.search(STREET_START_RE, ln):
+                continue
+
+            cleaned = clean_address_line(ln)
+            if not cleaned:
+                continue
+
+            if not any(ch.isalpha() for ch in cleaned):
+                continue
+
+            score = 100 - i
+            toks = set(re.split(r"\s+", cleaned.upper()))
+            if toks.intersection(street_suffixes):
+                score += 15
+            if matches_any(cleaned, RE_ADDR_BLOCK):
+                score += 5
+            if "," in cleaned:
+                score -= 5
+
+            cand = (score, i, cleaned)
+            if (best is None) or (cand[0] > best[0]):
+                best = cand
+
+        if best is not None:
+            _, idx2, best_street = best
+            candidates.append({
+                "Index": idx2,
+                "Street": best_street,
+                "City": "",
+                "State": "",
+                "ZIP": "",
+                "CityStateZip": "",
+                "Score": 35,
+            })
+    if not candidates:
+        for i, line in enumerate(lines):
+            if looks_like_address_line(line):
+                return {"Index": i, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": line}
+        return {"Index": None, "Street": "", "City": "", "State": "", "ZIP": "", "AddressRaw": ""}
+
+    best = sorted(candidates, key=lambda x: x["Score"], reverse=True)[0]
+    street = best.get("Street", "")
+    city = best.get("City", "")
+    state = best.get("State", "")
+    zipc = best.get("ZIP", "")
+
+    # if city wasn't parsed, derive from CityStateZip
+    if not city and best.get("CityStateZip") and state and not best.get("Inline"):
+        m = re.search(US_STATE_RE, best["CityStateZip"], re.IGNORECASE)
+        if m:
+            city_part = best["CityStateZip"][:m.start()]
+            city = normalize_ws(city_part).replace(",", "")
+
+    address_raw = best.get("CityStateZip", "") if best.get("Inline") else f"{street} | {best.get('CityStateZip','')}".strip(" |")
+
+    return {
+        "Index": best.get("Index"),
+        "Street": street,
+        "City": city,
+        "State": state,
+        "ZIP": zipc,
+        "AddressRaw": address_raw,
+    }
+
+
+# -----------------------------
+
+# ---------------------------------
+# REVIEW / SALVAGE + ALT OCR HELPERS
+# ---------------------------------
+def extract_state_zip_anywhere(text: str) -> Tuple[str, str]:
+    """Best-effort: find ZIP and nearby state anywhere in text (used for salvage)."""
+    t = fix_state_ocr_tokens(text or "")
+    zipm = re.search(ZIP_RE, t)
+    if not zipm:
+        return "", ""
+    left = t[max(0, zipm.start() - 30):zipm.start() + 5]
+    statem = re.search(US_STATE_RE, left, re.IGNORECASE)
+    st = normalize_state(statem.group(0)) if statem else ""
+    return st, zipm.group(0)
+
+
+def try_ocrmac_text(pil_img: Image.Image, recognition_level: str = 'accurate', framework: str = 'vision', language_preference: Optional[list] = None) -> str:
+    """Last-resort OCR using Apple Vision (ocrmac).
+
+    framework: 'vision' (default) or 'livetext' (macOS Sonoma+).
+    recognition_level: 'fast' or 'accurate' (vision only).
+    """
+    try:
+        from ocrmac import ocrmac  # type: ignore
+    except Exception:
+        return ''
+    try:
+        kwargs = {}
+        if language_preference:
+            kwargs['language_preference'] = language_preference
+        if framework:
+            kwargs['framework'] = framework
+        if framework == 'vision':
+            kwargs['recognition_level'] = recognition_level
+        anns = ocrmac.OCR(pil_img, **kwargs).recognize()
+        texts = [a[0] for a in anns if a and isinstance(a, (list, tuple)) and len(a) >= 1 and str(a[0]).strip()]
+        return '\n'.join(texts)
+    except Exception:
+        return ''
+
+def try_kraken_text(pil_img: Image.Image, model_path: str = '', kraken_bin: str = 'kraken', kraken_python: str = '') -> str:
+    """Last-resort OCR using Kraken via CLI. Requires kraken CLI + model.
+
+    If kraken_python is provided (pipx/venv python), derive the venv kraken executable from it.
+    """
+    if not model_path:
+        return ''
+    import tempfile
+    import subprocess
+    if kraken_python:
+        try:
+            kb = Path(kraken_python).expanduser().resolve().parent / 'kraken'
+            if kb.exists():
+                kraken_bin = str(kb)
+        except Exception:
+            pass
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            img_path = Path(td) / 'page.png'
+            out_path = Path(td) / 'out.txt'
+            pil_img.save(img_path)
+            cmd = [kraken_bin, '-i', str(img_path), str(out_path), 'binarize', 'segment', '-bl', 'ocr', '-m', model_path]
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if out_path.exists():
+                return out_path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return ''
+    return ''
+
+# HEADER PARSING
+# -----------------------------
+
+def is_gibberish(text: str) -> bool:
+    if not text or len(text) < 3:
+        return True
+    if not any(c.isupper() for c in text):
+        return True
+    if not re.search(r"[AEIOUYaeiouy]", text):
+        return True
+    words = text.split()
+    single_char_words = sum(1 for w in words if len(w) == 1 and w.lower() not in ["a", "i"])
+    if words and (single_char_words / len(words) > 0.4):
+        return True
+    return False
+
+
+def clean_address_line(line: str) -> str:
+    if not line:
+        return ""
+    m_owner = re.search(r"\bowner\s*(since|id)\b", line, re.IGNORECASE)
+    if m_owner:
+        line = line[:m_owner.start()]
+    m_date = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", line)
+    if m_date:
+        line = line[:m_date.start()]
+    return normalize_ws(line)
+
+
+def clean_name_line(line: str, target_char: Optional[str] = None, aggressive: bool = False) -> str:
+    if not line:
+        return ""
+    # v70.10: Noise Trimmer - cut off clusters of punctuation/symbols (scribbles/dirt)
+    m_noise = re.search(r"[\.,;:\-!\?]{3,}", line)
+    if m_noise:
+        line = line[:m_noise.start()]
+
+    line = fix_digit_initials_in_name(line)
+    if re.match(r"^\d", line):
+        line = fix_leading_digit_as_letter(line, target_char)
+        if re.match(r"^\d", line):
+            return ""
+
+    if matches_any(line, RE_NAME_GEO) or matches_any(line, RE_NAME_GENDER):
+        return ""
+
+    u = line.upper()
+    for city in CITY_BLOCKLIST:
+        idx = u.find(city)
+        if idx != -1:
+            line = line[:idx]
+            break
+
+    if "#" in line:
+        line = line.split("#")[0]
+
+    m_kw = re.search(r"\b(road|rd|street|st|avenue|ave|drive|dr|lane|ln|court|ct|blvd|boulevard|pkwy|parkway|hwy|highway|trl|trail|cir|circle|pl|place|po\s*box|box)\b", line, re.IGNORECASE)
+    if m_kw:
+        line = line[:m_kw.start()]
+
+    m_addr_start = re.search(r"\b\d+\s+[A-Za-z]", line)
+    if m_addr_start:
+        line = line[:m_addr_start.start()]
+
+    cleaned = line
+    for pat in RE_NAME_NOISE:
+        cleaned = pat.sub("", cleaned)
+
+    cleaned = re.sub(r"[^a-zA-Z\s&\.,\-']", "", cleaned)
+    cleaned = normalize_ws(cleaned)
+
+    if aggressive and target_char and cleaned and not cleaned.upper().startswith(target_char.upper()):
+        idx = cleaned.upper().find(target_char.upper())
+        if idx != -1:
+            cleaned = cleaned[idx:].strip()
+
+    return cleaned
+
+
+def get_header_candidate(lines: List[str], addr_idx: Optional[int], target_char: Optional[str], aggressive: bool) -> List[str]:
+    clean_header: List[str] = []
+    top = lines[:40]
+    search_lines = top[:addr_idx] if (addr_idx is not None and addr_idx > 0) else top[:10]
+    has_addr_context = addr_idx is not None and addr_idx > 0
+    search_iter = range(len(search_lines) - 1, -1, -1) if has_addr_context else range(len(search_lines))
+
+    for i in search_iter:
+        ln = search_lines[i]
+        if not ln.strip():
+            continue
+        if matches_any(ln, RE_NAME_BLACKLIST):
+            continue
+        ln_clean = clean_name_line(ln, target_char, aggressive)
+        if not ln_clean or is_gibberish(ln_clean):
+            continue
+        if has_addr_context:
+            clean_header.insert(0, ln_clean)
+        else:
+            clean_header.append(ln_clean)
+        if len(clean_header) >= 2:
+            break
+
+    return clean_header
+
+
+def parse_owner_header(lines: List[str], target_char: Optional[str] = None) -> Tuple[str, str, str, str, Dict, bool]:
+    if not lines:
+        return ("", "", "", "", {}, False)
+
+    top = lines[:40]
+    addr_info = parse_best_address(top)
+    addr_idx = addr_info.get("Index")
+
+    is_interment = any("INTERMENT RECORD" in ln.upper() for ln in top[:15])
+    if is_interment:
+        return ("INTERMENT RECORD - REFILE", "INTERMENT RECORD - REFILE", "", "", {}, True)
+
+    clean_header = get_header_candidate(lines, addr_idx, target_char, aggressive=False)
+    is_valid = False
+    if clean_header:
+        candidate = normalize_ws(" ".join(clean_header))
+        if target_char and candidate.upper().startswith(target_char.upper()):
+            is_valid = True
+        elif not target_char and not is_gibberish(candidate):
+            is_valid = True
+
+    if not is_valid:
+        clean_header = get_header_candidate(lines, addr_idx, target_char, aggressive=True)
+
+    header_text = normalize_ws(" ".join(clean_header))
+    header_text = re.sub(r"\b(owner|address|phone|lot|section|space|card)\b[:\-]?", "", header_text, flags=re.IGNORECASE).strip()
+
+    primary, secondary = "", ""
+    if re.search(r"\s&\s|\sand\s", header_text, re.IGNORECASE):
+        parts = re.split(r"\s&\s|\sand\s", header_text, flags=re.IGNORECASE)
+        parts = [normalize_ws(p) for p in parts if normalize_ws(p)]
+        if parts:
+            primary = parts[0]
+            secondary = parts[1] if len(parts) > 1 else ""
+    else:
+        primary = header_text
+
+    if "," in primary:
+        last_name = primary.split(",")[0].strip()
+    elif " " in primary:
+        last_name = primary.split(" ")[0].strip()
+    else:
+        last_name = primary
+
+    # Flag missing for trust-but-verify
+    if target_char and primary and not primary.upper().startswith(target_char.upper()):
+        primary = "[MISSING - CHECK PDF] " + primary
+
+    return (header_text, primary, secondary, last_name, addr_info, False)
+
+
+# -----------------------------
+# ITEM PARSING
+# -----------------------------
+
+# --- Structural / colon-style property detection (v70.10 fix) ---
+# These constants/regexes are referenced by classify_item() but were missing,
+# causing NameError: COLON_COUNT_PROP_MIN not defined.
+
+# Require at least 2 colons (e.g., "142:C:3" has 2)
+COLON_COUNT_PROP_MIN = 2
+
+# OCR-tolerant "structured property" patterns:
+# Handles common OCR swaps: 1/l/I, B/8, O/0
+# Examples:
+#   142:C:3
+#   119:8:1   (B -> 8)
+#   86:Sp.1-2-3-4:B:ATONEMENT
+STRUCT_PROP_RE = re.compile(
+    r"""
+    (?:\b\d{1,4}\s*[:/]\s*[A-Z0-9IL]{1,4}\s*[:/]\s*[0-9IL]{1,3}\b)       # 73:A:l / 142:C:3
+    |(?:\bSP\.?\s*\d{1,2}(?:-\d{1,2}){1,8}\b.*[:/]\s*[A-Z0-9IL]{1,4}\b)  # Sp.1-2-3-4 : B
+    |(?:\b\d{1,4}\s*[:/]\s*[A-Z0-9IL]{1,4}\b\s*[:/]\s*\d{1,3}\b)         # 86:B:1
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+# "Lot/Sec/Sp" location family (colon + label variants)
+# Examples:
+#   Gethsemane:Lot 186:Sec,C:Sp.3 4
+#   Last Supper:Lot 107:Sec.D:SP.2
+COLON_LOC_RE = re.compile(
+    r"""
+    (?:\bLOT\.?\s*[: ]\s*\d+\b)
+    .*?
+    (?:\bSEC(?:TION)?\.?\s*[: ,\.]?\s*[A-Z0-9IL]+\b)
+    .*?
+    (?:\bSP(?:ACE)?\.?\s*[: \.]?\s*\d+(?:-\d+)?\b)
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+def is_excludable_item(line: str) -> bool:
+    return matches_any(line, RE_XFER)
+
+
+def classify_item(line: str) -> Dict[str, bool]:
+    """Classify an item line with OCR-tolerant property detection."""
+    t = line or ""
+    u = t.upper()
+
+    structural_prop = bool(t.count(":") >= COLON_COUNT_PROP_MIN and (STRUCT_PROP_RE.search(u) or COLON_LOC_RE.search(u)))
+    kw_prop = bool(re.search(r"\b(space|sp\.?|lot|section|sec\.?|block|blk\.?|garden|crypt|lawn|grave|burial|mausoleum|maus\.?|niche|columbarium|estates?)\b", t, re.IGNORECASE))
+    is_prop = bool(kw_prop or structural_prop or bool(RIGHTS_NOTATION_RE.search(t)) or heuristic_is_property(t))
+
+    flags = {
+        "IsProperty": is_prop,
+        "IsMemorial": matches_any(t, RE_MEMORIAL),
+        "IsFuneralPreneed": matches_any(t, RE_FUNERAL_PN),
+        "IsAtNeedFuneral": matches_any(t, RE_AT_NEED),
+        "IsIntermentService": matches_any(t, RE_INTERMENT),
+        "HasRightsNotation": bool(RIGHTS_NOTATION_RE.search(t)),
+    }
+    if flags["IsIntermentService"]:
+        flags["IsFuneralPreneed"] = False
+    if flags["IsAtNeedFuneral"]:
+        flags["IsFuneralPreneed"] = False
+    return flags
+
+def rights_used_total(line: str) -> Optional[Tuple[int, int, str]]:
+    m = RIGHTS_NOTATION_RE.search(line or "")
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    return (a, b, f"{a}/{b}")
+
+def item_dict_from_line(txt: str, struck: bool = False) -> Dict:
+    excludable = is_excludable_item(txt)
+    cls = classify_item(txt)
+    looks_item = (cls["IsProperty"] or cls["IsMemorial"] or cls["IsFuneralPreneed"] or cls["IsAtNeedFuneral"] or cls["HasRightsNotation"])
+    include = looks_item and (not struck) and (not excludable)
+    rt = rights_used_total(txt)
+    return {
+        "LineText": txt,
+        "StruckThrough": bool(struck),
+        "ExcludedByText": bool(excludable),
+        "Include": bool(include),
+        "IsProperty": bool(cls["IsProperty"]),
+        "IsMemorial": bool(cls["IsMemorial"]),
+        "IsFuneralPreneed": bool(cls["IsFuneralPreneed"]),
+        "IsAtNeedFuneral": bool(cls["IsAtNeedFuneral"]),
+        "IsIntermentService": bool(cls["IsIntermentService"]),
+        "RightsNotation": rt[2] if rt else "",
+        "RightsUsed": rt[0] if rt else None,
+        "RightsTotal": rt[1] if rt else None,
+    }
+
+def parse_items_from_text(lines: List[str], template_type: str) -> List[Dict]:
+    items: List[Dict] = []
+    if template_type == "modern_table":
+        in_items = False
+        for ln in lines:
+            u = ln.upper()
+            if "ITEM DESCRIPTION" in u:
+                in_items = True
+                continue
+            if not in_items:
+                continue
+            if "OWNER ID" in u or "OWNER SINCE" in u:
+                break
+            txt = normalize_ws(ln)
+            if not txt:
+                continue
+            if txt.upper() in {"USED", "USED?", "CONTRACT NBR", "SALES DATE", "PRICE"}:
+                continue
+            items.append(item_dict_from_line(txt, struck=False))
+        return items
+
+    for ln in lines[5:]:
+        txt = normalize_ws(ln)
+        if not txt:
+            continue
+        if matches_any(txt, RE_NAME_BLACKLIST):
+            continue
+        cls = classify_item(txt)
+        if cls["IsProperty"] or cls["IsMemorial"] or cls["IsFuneralPreneed"] or cls["IsAtNeedFuneral"] or cls["HasRightsNotation"]:
+            items.append(item_dict_from_line(txt, struck=False))
+    return items
+
+
+# -----------------------------
+# SCORING
+# -----------------------------
+
+def score_text_pass(txt: str) -> int:
+    if not txt:
+        return 0
+    u = txt.upper()
+    score = 0
+    if re.search(ZIP_RE, u):
+        score += 40
+    if re.search(US_STATE_RE, u, re.IGNORECASE):
+        score += 20
+    if "OWNER ID" in u:
+        score += 20
+    if "ITEM DESCRIPTION" in u:
+        score += 20
+    good_lines = [ln for ln in split_lines(txt) if not is_gibberish(ln)]
+    score += min(len(good_lines), 60)
+    return score
+
+
+# -----------------------------
+
+# --- Header-only OCR ensemble (for rotation + better name/address) ---
+def ocr_header_ensemble(pil_page: Image.Image, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, alt_ocr: str = "ocrmac_then_kraken") -> tuple[str, dict]:
+    header_img, _ = crop_header(pil_page)
+    scales = [1.0, 2.0, 3.0]
+    variants = []
+    for s in scales:
+        if s != 1.0:
+            w, h = header_img.size
+            img_s = header_img.resize((int(w*s), int(h*s)), resample=Image.BICUBIC)
+        else:
+            img_s = header_img
+        variants.extend([('STD', preprocess_standard(img_s)), ('CLAHE', preprocess_clahe(img_s)), ('GHOST', preprocess_ghost(img_s)), ('SHADOW', preprocess_shadow_correct(img_s)), ('SHARP', unsharp_mask(img_s))])
+    psm_list = [6, 4, 11]
+    best_name = ''
+    best_text = ''
+    best_score = -1
+    used = {'tesseract': False, 'ocrmac_vision': False, 'ocrmac_livetext': False, 'kraken': False}
+    for tag, img_v in variants:
+        if best_score >= 95:
+            break
+        for psm in psm_list:
+            try:
+                cfg = f"{TESS_CONFIG_BASE} --psm {psm}"
+                t = _tess_image_to_string(img_v, config=cfg)
+            except Exception:
+                t = ''
+            used['tesseract'] = True
+            sc = score_header_text(t)
+            if sc > best_score:
+                best_score = sc
+                best_text = t
+                best_name = f"TESS_{tag}_PSM{psm}_S{sc}"
+                # v70.10: stop early when header OCR is already very strong
+                if best_score >= 95:
+                    break
+    alt_mode = (alt_ocr or "").strip().lower()
+    allow_alt = alt_mode != "none"
+    prefer_kraken = alt_mode == "kraken_then_ocrmac"
+
+    best = {"score": best_score, "text": best_text, "name": best_name}
+
+    def try_ocrmac():
+        if not allow_alt:
+            return
+        t_vision = try_ocrmac_text(header_img, recognition_level='accurate', framework='vision', language_preference=['en-US'])
+        if t_vision:
+            used['ocrmac_vision'] = True
+            sc = score_header_text(t_vision)
+            if sc > best["score"]:
+                best.update({"score": sc, "text": t_vision, "name": f"OCRMAC_VISION_S{sc}"})
+        if allow_livetext:
+            t_lt = try_ocrmac_text(header_img, framework='livetext', language_preference=['en-US'])
+            if t_lt:
+                used['ocrmac_livetext'] = True
+                sc = score_header_text(t_lt)
+                if sc > best["score"]:
+                    best.update({"score": sc, "text": t_lt, "name": f"OCRMAC_LIVETEXT_S{sc}"})
+
+    def try_kraken():
+        if not allow_alt or not kraken_model:
+            return
+        t_k = try_kraken_text(header_img, model_path=kraken_model, kraken_bin=kraken_bin, kraken_python=kraken_python)
+        if t_k:
+            used['kraken'] = True
+            sc = score_header_text(t_k)
+            if sc > best["score"]:
+                best.update({"score": sc, "text": t_k, "name": f"KRAKEN_S{sc}"})
+
+    if prefer_kraken:
+        if best["score"] < 45:
+            try_kraken()
+        if best["score"] < 45:
+            try_ocrmac()
+    else:
+        try_ocrmac()
+        if best["score"] < 45:
+            try_kraken()
+
+    best_score = best["score"]
+    best_text = best["text"]
+    best_name = best["name"]
+    meta = {'best': best_name, 'score': best_score, **used}
+    return best_text, meta
+
+# PAGE PROCESSOR
+# -----------------------------
+
+def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str], reader: Optional[PdfReader] = None, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, facts_sections: Optional[List[str]] = None, facts_mode: str = '', alt_ocr: str = "ocrmac_then_kraken") -> Tuple[Dict, List[Dict], bool]:
+    """Returns (owner_dict, items_list, is_interment)."""
+
+    # TEXT LAYER FIRST
+    pdf_text = extract_pdf_text_page(pdf_path, page_index, reader=reader)
+    if text_layer_usable(pdf_text):
+        txt = pdf_text
+        lines = split_lines(txt)
+        template_type = detect_template_type(txt)
+        _, p, s, last, addr, is_interment = parse_owner_header(lines, target_char)
+
+        # trust-but-verify
+        ok = bool(p) and "[MISSING" not in p and ((not target_char) or p.strip().upper().startswith(target_char.upper()))
+        if ok:
+            owner_header_meta = {}
+            phone_fields = extract_phone_fields(txt, lines)
+            # v65: If PDF text layer is usable but lacks phone data, run header OCR to recover phones
+            try:
+                if (not phone_fields.get('PhoneValid')) and (not (phone_fields.get('PhoneRaw') or phone_fields.get('Phone') or phone_fields.get('PhoneNormalized'))):
+                    pil_h = render_page_deskew(pdf_path, page_index, dpi=min(dpi, 300))
+                    if pil_h is not None:
+                        htxt, hmeta = ocr_header_ensemble(
+                            pil_h,
+                            kraken_model=kraken_model,
+                            kraken_bin=kraken_bin,
+                            kraken_python=kraken_python,
+                            allow_livetext=allow_livetext,
+                            alt_ocr=alt_ocr,
+                        )
+                        hlines = split_lines(htxt)
+                        p2 = extract_phone_fields(htxt, hlines)
+                        if p2.get('PhoneValid') and p2.get('PhoneNormalized'):
+                            phone_fields.update(p2)
+                        owner_header_meta = hmeta
+            except Exception:
+                pass
+
+            # ---- Strike detection parity ----
+            strike_dpi = min(200, max(150, dpi // 2))
+            strike_segs, strike_pil = detect_strike_segs_for_page(pdf_path, page_index, dpi=strike_dpi)
+            if strike_segs and strike_pil is not None:
+                # v65: detect strikes at lower DPI, but OCR items at full DPI for better accuracy
+                full_pil = render_page_deskew(pdf_path, page_index, dpi=dpi)
+                if full_pil is not None:
+                    try:
+                        sw, sh = strike_pil.size
+                        fw, fh = full_pil.size
+                        fx = fw / max(sw, 1)
+                        fy = fh / max(sh, 1)
+                        scaled = [(int(x1*fx), int(y1*fy), int(x2*fx), int(y2*fy)) for (x1,y1,x2,y2) in strike_segs]
+                    except Exception:
+                        scaled = strike_segs
+                    items = [] if is_interment else ocr_items_with_strike_from_image(full_pil, strike_segs=scaled)
+                else:
+                    items = [] if is_interment else ocr_items_with_strike_from_image(strike_pil, strike_segs=strike_segs)
+            else:
+                items = [] if is_interment else parse_items_from_text(lines, template_type)
+            # v70.10: salvage State/ZIP from anywhere on page when text-layer address parse is incomplete
+            try:
+                if (not addr.get('State')) or (not addr.get('ZIP')):
+                    st2, z2 = extract_state_zip_anywhere(txt)
+                    if st2 and not addr.get('State'):
+                        addr['State'] = st2
+                    if z2 and not addr.get('ZIP'):
+                        addr['ZIP'] = z2
+            except Exception:
+                pass
+            owner = {
+                "OwnerName_Raw": normalize_ws(f"{p} {s}"),
+                "PrimaryOwnerName": p,
+                "SecondaryOwnerName": s,
+                "LastName": last,
+                "Street": addr.get("Street", ""),
+                "City": addr.get("City", ""),
+                "State": addr.get("State", ""),
+                "ZIP": addr.get("ZIP", ""),
+                "AddressRaw": addr.get("AddressRaw", ""),
+                "RawText": txt,
+                "RawTextHash": sha1_text(txt),
+                "TemplateType": template_type,
+                "TextSource": "PDF_TEXT_LAYER" + ("_WITH_STRIKE_OCR" if strike_segs else ""),
+                # v65: diagnostics for header OCR (populated when header OCR ran)
+                "HeaderOCRBest": (owner_header_meta.get('best','') if isinstance(owner_header_meta, dict) else ''),
+                "HeaderOCRScore": (owner_header_meta.get('score','') if isinstance(owner_header_meta, dict) else ''),
+                "HeaderOCRUsedTesseract": bool(owner_header_meta.get('tesseract')) if isinstance(owner_header_meta, dict) else False,
+                "HeaderOCRUsedOCRmacVision": bool(owner_header_meta.get('ocrmac_vision')) if isinstance(owner_header_meta, dict) else False,
+                "HeaderOCRUsedOCRmacLiveText": bool(owner_header_meta.get('ocrmac_livetext')) if isinstance(owner_header_meta, dict) else False,
+                "HeaderOCRUsedKraken": bool(owner_header_meta.get('kraken')) if isinstance(owner_header_meta, dict) else False,
+            }
+            owner.update(phone_fields)
+            owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=None, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader)
+            return owner, items, is_interment
+
+    # OCR FALLBACK (full)
+    pil_original = render_page(pdf_path, page_index, dpi=dpi)
+    if pil_original is None:
+        raise RuntimeError(f"Failed to render page {page_index+1}")
+
+    orig_bgr = cv2.cvtColor(np.array(pil_original), cv2.COLOR_RGB2BGR)
+    orig_bgr = dewarp_perspective(orig_bgr)
+    orig_bgr = deskew_bgr(orig_bgr)
+    pil_original = Image.fromarray(cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB))
+
+    # --- v65: Header-targeted OCR ensemble (top region) ---
+    header_text, header_meta = ocr_header_ensemble(
+        pil_original,
+        kraken_model=kraken_model,
+        kraken_bin=kraken_bin,
+        kraken_python=kraken_python,
+        allow_livetext=allow_livetext,
+        alt_ocr=alt_ocr,
+    )
+
+    pil_std = preprocess_standard(pil_original)
+    pil_clahe = preprocess_clahe(pil_original)
+    pil_ghost = preprocess_ghost(pil_original)
+
+    t_std = _tess_image_to_string(pil_std, config=OCR_PSM6)
+    t_clahe = _tess_image_to_string(pil_clahe, config=OCR_PSM6)
+    t_ghost = _tess_image_to_string(pil_ghost, config=OCR_PSM6)
+    t_sparse = _tess_image_to_string(pil_original, config=OCR_PSM11)
+
+    candidates = [("STD", t_std), ("CLAHE", t_clahe), ("GHOST", t_ghost), ("SPARSE", t_sparse)]
+    best_name, best_text, best_score = sorted(
+        [(n, t, score_text_pass(t)) for (n, t) in candidates],
+        key=lambda x: x[2], reverse=True
+    )[0]
+
+    lines_best = split_lines(header_text if header_text else best_text)
+    template_type = detect_template_type(best_text)
+    _, p, s, last, addr, is_interment = parse_owner_header(lines_best, target_char)
+    phone_fields = extract_phone_fields(header_text if header_text else best_text, lines_best)
+    # Visual Sniper: salvage ZIP/State if missing
+    if (not addr.get('State')) or (not addr.get('ZIP')):
+        st2, z2 = extract_state_zip_anywhere(best_text)
+        if st2 or z2:
+            addr['State'] = addr.get('State') or st2
+            addr['ZIP'] = addr.get('ZIP') or z2
+    # items with strike detection
+    strike_segs = detect_horizontal_strikelines(orig_bgr)
+    items = [] if is_interment else ocr_items_with_strike_from_image(pil_original, strike_segs=strike_segs, y_min_frac=ITEMS_START_RATIO)
+
+    combined_raw = "\n".join([t_std, t_clahe, t_ghost, t_sparse])
+
+    owner = {
+        "OwnerName_Raw": normalize_ws(f"{p} {s}"),
+        "PrimaryOwnerName": p,
+        "SecondaryOwnerName": s,
+        "LastName": last,
+        "Street": addr.get("Street", ""),
+        "City": addr.get("City", ""),
+        "State": addr.get("State", ""),
+        "ZIP": addr.get("ZIP", ""),
+        "AddressRaw": addr.get("AddressRaw", ""),
+        "RawText": combined_raw,
+        "RawTextHash": sha1_text(combined_raw),
+        "TemplateType": template_type,
+        "TextSource": f"OCR_FALLBACK_{best_name}_S{best_score}",
+        # v65: capture which header OCR backend won (useful diagnostics)
+        "HeaderOCRBest": header_meta.get('best','') if isinstance(header_meta, dict) else '',
+        "HeaderOCRScore": header_meta.get('score','') if isinstance(header_meta, dict) else '',
+        "HeaderOCRUsedTesseract": bool(header_meta.get('tesseract')) if isinstance(header_meta, dict) else False,
+        "HeaderOCRUsedOCRmacVision": bool(header_meta.get('ocrmac_vision')) if isinstance(header_meta, dict) else False,
+        "HeaderOCRUsedOCRmacLiveText": bool(header_meta.get('ocrmac_livetext')) if isinstance(header_meta, dict) else False,
+        "HeaderOCRUsedKraken": bool(header_meta.get('kraken')) if isinstance(header_meta, dict) else False,
+    }
+    owner.update(phone_fields)
+    owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=pil_original, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader)
+    return owner, items, is_interment
+
+
+# -----------------------------
+# NEIGHBOR CONTEXT + LISTS
+# -----------------------------
+
+def apply_neighbor_context(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for i in range(1, len(df) - 1):
+        raw = df.at[i, "PrimaryOwnerName"]
+        name = "" if pd.isna(raw) else str(raw)
+        if "[MISSING" in name or (name and not name[0].isalpha()):
+            prev_name = str(df.at[i - 1, "PrimaryOwnerName"])
+            next_name = str(df.at[i + 1, "PrimaryOwnerName"])
+            if "," in prev_name and "," in next_name:
+                prev_last = prev_name.split(",")[0].strip().upper()
+                next_last = next_name.split(",")[0].strip().upper()
+                if prev_last == next_last and prev_last:
+                    garbage = name.replace("[MISSING - CHECK PDF]", "").strip()
+                    df.at[i, "PrimaryOwnerName"] = f"{prev_last}, {garbage} [Context Fix]"
+                    df.at[i, "LastName"] = prev_last
+    return df
+
+def total_owners_on_file(primary: str, secondary: str) -> int:
+    return 2 if normalize_ws(secondary) else 1
+
+def compute_likely_burials(items: List[Dict]) -> int:
+    used_counts: List[int] = []
+    for it in items:
+        if not it.get("Include", False):
+            continue
+        if not it.get("IsProperty", False):
+            continue
+        txt = (it.get("LineText", "") or "").upper()
+        if re.search(r"\bX\b", txt) or re.search(r"\bUSED\b", txt):
+            used_counts.append(1)
+        ru = it.get("RightsUsed", None)
+        if ru is not None:
+            try:
+                if not pd.isna(ru):
+                    used_counts.append(int(ru))
+            except Exception:
+                pass
+    # v65 NOTE: We intentionally use MAX across property lines as a conservative estimate of burials on the card.
+    # If you need a total across multiple properties, use compute_likely_burials_sum().
+    return max(used_counts) if used_counts else 0
+
+
+# -----------------------------
+# DATASET PROCESSOR
+# -----------------------------
+
+
+def compute_likely_burials_sum(items: List[Dict]) -> int:
+    """Sum burial indicators across multiple property lines (more aggressive than MAX)."""
+    total = 0
+    for it in (items or []):
+        if not it.get("Include", False):
+            continue
+        if not it.get("IsProperty", False):
+            continue
+        txt = (it.get("LineText", "") or "").upper()
+        if re.search(r"\bX\b", txt) or re.search(r"\bUSED\b", txt):
+            total += 1
+            continue
+        ru = it.get("RightsUsed", None)
+        if ru is not None:
+            try:
+                if not pd.isna(ru):
+                    total += int(ru)
+            except Exception:
+                pass
+    return int(total)
+
+def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, facts_path: str = '', alt_ocr: str = "ocrmac_then_kraken"):
+    # v65: FaCTS load mode tracking (not_provided vs loaded vs failed)
+    facts_mode = 'not_provided'
+    facts_sections = []
+    if facts_path:
+        if not os.path.exists(facts_path):
+            facts_mode = 'failed'
+        else:
+            facts_sections = load_facts_sections(facts_path)
+            facts_mode = 'loaded' if facts_sections else 'failed'
+            _update_garden_regex_from_facts(facts_sections)
+    if not os.path.exists(pdf_path):
+        print(f"Error: {pdf_path} not found.")
+        return
+
+    filename = os.path.basename(pdf_path)
+    target_char = filename[0].upper() if filename and filename[0].isalpha() else None
+    record_prefix = target_char if target_char else "A"
+
+    print(f"\n[Info] Processing '{filename}' | Target: '{target_char}' | Prefix: {record_prefix}")
+
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception:
+        reader = None
+
+    try:
+        page_count = pdfinfo_from_path(pdf_path)["Pages"]
+    except Exception:
+        if reader is None:
+            print("Error: Unable to read PDF metadata for page count.")
+            return
+        page_count = len(reader.pages)
+
+    owners_rows: List[Dict] = []
+    items_rows: List[Dict] = []
+    interment_rows: List[Dict] = []
+
+    for p in tqdm(range(page_count), desc=f"Scanning {filename}", unit="page"):
+        owner_data, items_data, is_interment = process_page(
+            pdf_path,
+            p,
+            dpi,
+            target_char,
+            reader=reader,
+            kraken_model=kraken_model,
+            kraken_bin=kraken_bin,
+            kraken_python=kraken_python,
+            allow_livetext=allow_livetext,
+            facts_sections=facts_sections,
+            facts_mode=facts_mode,
+            alt_ocr=alt_ocr,
+        )
+
+        rec_id = f"{record_prefix}-P{p+1:04d}"
+        owner_data["OwnerRecordID"] = rec_id
+        owner_data["SourceFile"] = filename
+        owner_data["PageNumber"] = p + 1
+
+        if is_interment:
+            interment_rows.append(owner_data)
+        else:
+            parts = [
+                safe_upper(owner_data.get("PrimaryOwnerName", "")),
+                safe_upper(owner_data.get("SecondaryOwnerName", "")),
+                safe_upper(owner_data.get("Street", "")),
+                (owner_data.get("ZIP", "") or ""),
+            ]
+            owner_data["OwnerGroupKey"] = sha1_text("|".join(parts))[:12]
+            owners_rows.append(owner_data)
+
+            for it in items_data:
+                it["OwnerRecordID"] = rec_id
+                it["SourceFile"] = filename
+                it["Page"] = p + 1
+                items_rows.append(it)
+
+    owners_df = pd.DataFrame(owners_rows)
+    items_df = pd.DataFrame(items_rows)
+    interment_df = pd.DataFrame(interment_rows)
+
+    if not owners_df.empty:
+        owners_df = apply_neighbor_context(owners_df)
+
+    owners_df = force_string_cols(owners_df, ["ZIP", "OwnerRecordID", "OwnerGroupKey"])
+    if not interment_df.empty:
+        interment_df = force_string_cols(interment_df, ["ZIP", "OwnerRecordID"])
+
+    possible_dups = pd.DataFrame()
+    if not owners_df.empty and "RawTextHash" in owners_df.columns:
+        dup = owners_df.groupby("RawTextHash").size().reset_index(name="Count")
+        dup = dup[dup["Count"] > 1]
+        if not dup.empty:
+            possible_dups = owners_df.merge(dup, on="RawTextHash", how="inner").sort_values(["RawTextHash", "PageNumber"])
+
+    inc = items_df[items_df.get("Include", False) == True].copy() if not items_df.empty else pd.DataFrame()
+    all_items = items_df.copy() if not items_df.empty else pd.DataFrame()
+
+    # v70.10 debug: capture lines that look like property candidates but were not classified as property
+    debug_rows = []
+    if not all_items.empty and 'LineText' in all_items.columns:
+        for _, r in all_items.iterrows():
+            txt = str(r.get('LineText', '') or '')
+            u = txt.upper()
+            coord = bool(COORD_OCR_FUZZ_RE.search(u))
+            colons = (u.count(':') + u.count('/'))
+            kw = bool(re.search(r"\b(SP\.?|SPACE|LOT|SEC\.?|SECTION|BLOCK|BLK\.?|GRAVE|CRYPT|LAWN)\b", u))
+            if (coord or colons >= 2 or kw) and (not bool(r.get('IsProperty', False))):
+                why = []
+                if coord: why.append('coord')
+                if colons >= 2: why.append('colon')
+                if kw: why.append('kw')
+                debug_rows.append({'OwnerRecordID': r.get('OwnerRecordID',''), 'Page': r.get('Page', r.get('PageNumber','')), 'LineText': txt, 'Why': '+'.join(why)})
+    debug_df = pd.DataFrame(debug_rows)
+
+    def agg_owner(group: pd.DataFrame) -> pd.Series:
+        has_property = bool(group.get("IsProperty", False).any())
+        has_memorial = bool(group.get("IsMemorial", False).any())
+        has_pn = bool(group.get("IsFuneralPreneed", False).any())
+        has_an = bool(group.get("IsAtNeedFuneral", False).any())
+
+        memorial_lines = group[group.get("IsMemorial", False) == True]["LineText"].tolist() if "LineText" in group else []
+        pn_lines = group[group.get("IsFuneralPreneed", False) == True]["LineText"].tolist() if "LineText" in group else []
+        an_lines = group[group.get("IsAtNeedFuneral", False) == True]["LineText"].tolist() if "LineText" in group else []
+        property_lines = group[group.get("IsProperty", False) == True]["LineText"].tolist() if "LineText" in group else []
+
+        likely_burials = compute_likely_burials(group.to_dict("records"))
+        likely_burials_sum = compute_likely_burials_sum(group.to_dict("records"))
+
+        matching_owner = owners_df[owners_df["OwnerRecordID"] == group.name]
+        if not matching_owner.empty:
+            total_owners = total_owners_on_file(matching_owner.iloc[0].get("PrimaryOwnerName", ""), matching_owner.iloc[0].get("SecondaryOwnerName", ""))
+        else:
+            total_owners = 1
+
+        living_exists = True if int(likely_burials) < int(total_owners) else False
+
+        pn_status = "TRUE" if has_pn else "FALSE"
+        if total_owners == 2 and has_pn:
+            policy_like = [ln for ln in pn_lines if re.search(r"\bpolicy\b", ln, re.IGNORECASE)]
+            if len(policy_like) == 1:
+                pn_status = "PARTIAL"
+
+        needs_memorial = bool(has_property and (not has_memorial))
+        needs_pn = bool(has_property and (pn_status in ["FALSE", "PARTIAL"]))
+        spaces_only_prime = bool(has_property and (not has_memorial) and (pn_status in ["FALSE", "PARTIAL"]) and living_exists)
+        survivor_opp = bool((total_owners == 2) and (len(an_lines) == 1) and (pn_status in ["FALSE", "PARTIAL"]) and has_property and living_exists)
+
+        return pd.Series({
+            "HasProperty": has_property,
+            "HasMemorial": has_memorial,
+            "HasAtNeedFuneral": has_an,
+            "HasFuneralPreneedPlanStatus": pn_status,
+            "LikelyBurials": int(likely_burials),
+            "LikelyBurialsSum": int(likely_burials_sum),
+            "TotalOwnersOnFile": int(total_owners),
+            "LivingOwnerExists": bool(living_exists),
+            "NeedsMemorial": bool(needs_memorial),
+            "NeedsPNFuneral": bool(needs_pn),
+            "SpacesOnly_PRIME": bool(spaces_only_prime),
+            "SurvivorSpouse_Opportunity": bool(survivor_opp),
+            "MemorialEvidence": " || ".join(memorial_lines[:3]),
+            "PNFuneralEvidence": " || ".join(pn_lines[:3]),
+            "AtNeedEvidence": " || ".join(an_lines[:3]),
+            "PropertyEvidence": " || ".join(property_lines[:3]),
+        })
+
+    def agg_owner_any(group: pd.DataFrame) -> pd.Series:
+        """Audit-only: property presence even if struck/excluded.
+
+        Robust to missing columns and avoids .any() on a scalar.
+        """
+        # IsProperty column
+        if "IsProperty" in group.columns:
+            isprop_series = group["IsProperty"].fillna(False).astype(bool)
+            has_isprop = isprop_series.any()
+            prop_lines_any = group.loc[isprop_series, "LineText"].tolist() if "LineText" in group.columns else []
+        else:
+            has_isprop = False
+            prop_lines_any = []
+
+        # Rights evidence: RightsNotation string OR RightsUsed/RightsTotal numeric
+        has_rights = False
+        if "RightsNotation" in group.columns:
+            has_rights = group["RightsNotation"].fillna("").astype(str).str.strip().ne("").any()
+        if (not has_rights) and ("RightsUsed" in group.columns):
+            try:
+                has_rights = group["RightsUsed"].notna().any()
+            except Exception:
+                pass
+        if (not has_rights) and ("RightsTotal" in group.columns):
+            try:
+                has_rights = group["RightsTotal"].notna().any()
+            except Exception:
+                pass
+
+        has_prop_any = bool(has_isprop or has_rights)
+        return pd.Series({
+            "HasPropertyAny": bool(has_prop_any),
+            "PropertyEvidenceAny": "\\n\\n".join([str(x) for x in prop_lines_any[:3]]),
+        })
+
+    try:
+        owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner, include_groups=False).reset_index() if not inc.empty else pd.DataFrame(columns=["OwnerRecordID"])
+    except TypeError:
+        owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner).reset_index() if not inc.empty else pd.DataFrame(columns=["OwnerRecordID"])
+    try:
+        owner_flags_any = all_items.groupby("OwnerRecordID").apply(agg_owner_any, include_groups=False).reset_index() if (not all_items.empty) else pd.DataFrame(columns=["OwnerRecordID"])
+    except TypeError:
+        owner_flags_any = all_items.groupby("OwnerRecordID").apply(agg_owner_any).reset_index() if (not all_items.empty) else pd.DataFrame(columns=["OwnerRecordID"])
+
+    owners_master = owners_df.merge(owner_flags, on="OwnerRecordID", how="left") if not owners_df.empty else pd.DataFrame()
+    if not owners_master.empty and not owner_flags_any.empty:
+        owners_master = owners_master.merge(owner_flags_any, on="OwnerRecordID", how="left")
+
+    defaults = {
+
+        "HasPropertyAny": False,
+        "PropertyEvidenceAny": "",
+        "HasProperty": False, "HasMemorial": False, "HasAtNeedFuneral": False,
+        "HasFuneralPreneedPlanStatus": "FALSE", "LikelyBurials": 0, "TotalOwnersOnFile": 1,
+        "LivingOwnerExists": True, "NeedsMemorial": False, "NeedsPNFuneral": False,
+        "SpacesOnly_PRIME": False, "SurvivorSpouse_Opportunity": False,
+        "MemorialEvidence": "", "PNFuneralEvidence": "", "AtNeedEvidence": "", "PropertyEvidence": "",
+    }
+    if not owners_master.empty:
+        for col, default in defaults.items():
+            if col in owners_master.columns:
+                owners_master[col] = owners_master[col].fillna(default)
+
+    # Lists
+    if not owners_master.empty:
+        list_memorial = owners_master[(owners_master["HasProperty"] == True) & (owners_master["HasMemorial"] != True) & (owners_master["LivingOwnerExists"] == True)].copy()
+        list_pn = owners_master[(owners_master["HasProperty"] == True) & (owners_master["HasFuneralPreneedPlanStatus"].isin(["FALSE", "PARTIAL"])) & (owners_master["LivingOwnerExists"] == True)].copy()
+        list_prime = owners_master[owners_master["SpacesOnly_PRIME"] == True].copy()
+        list_survivor = owners_master[owners_master["SurvivorSpouse_Opportunity"] == True].copy()
+    else:
+        list_memorial = list_pn = list_prime = list_survivor = pd.DataFrame()
+
+    # PhoneExceptions
+    phone_exceptions = pd.DataFrame()
+    if not owners_master.empty:
+        def has_text(x):
+            s = "" if x is None else str(x)
+            return bool(s.strip()) and s.strip().lower() != "nan"
+
+        phone_exceptions = owners_master[
+            owners_master.get("PhoneRaw", "").apply(has_text) &
+            (
+                (owners_master.get("PhoneValid", False) == False) |
+                (owners_master.get("PhoneNormalized", "").apply(lambda x: not has_text(x))) |
+                ((owners_master.get("PhoneAltNormalized", "").apply(has_text)) & (owners_master.get("PhoneAltValid", True) == False))
+            )
+        ].copy()
+
+    stats = pd.DataFrame([{
+        "GeneratedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SourceFile": filename,
+        "PagesDetected": page_count,
+        "OwnerRecords": int(len(owners_master)) if not owners_master.empty else 0,
+        "IntermentRecordsFound": int(len(interment_df)) if not interment_df.empty else 0,
+        "PossibleDuplicateScans": int(len(possible_dups)) if not possible_dups.empty else 0,
+        "LIST_Memorial_Letter": int(len(list_memorial)) if not list_memorial.empty else 0,
+        "LIST_PN_Funeral_Letter": int(len(list_pn)) if not list_pn.empty else 0,
+        "LIST_SpacesOnly_PRIME": int(len(list_prime)) if not list_prime.empty else 0,
+        "LIST_SurvivorSpouse": int(len(list_survivor)) if not list_survivor.empty else 0,
+        "PhoneExceptions": int(len(phone_exceptions)) if not phone_exceptions.empty else 0,
+        "NeedsReviewRows": int(owners_master["NeedsReview"].fillna(False).map(lambda v: (v is True) or (str(v).strip().upper() in ("TRUE","1","YES","Y"))).sum()) if (not owners_master.empty and "NeedsReview" in owners_master.columns) else 0,
+    }])
+
+    owners_master_safe = make_df_excel_safe(owners_master) if not owners_master.empty else pd.DataFrame()
+    items_df_safe = make_df_excel_safe(items_df) if not items_df.empty else pd.DataFrame()
+    list_memorial_safe = make_df_excel_safe(list_memorial) if not list_memorial.empty else pd.DataFrame()
+    list_pn_safe = make_df_excel_safe(list_pn) if not list_pn.empty else pd.DataFrame()
+    list_prime_safe = make_df_excel_safe(list_prime) if not list_prime.empty else pd.DataFrame()
+    list_survivor_safe = make_df_excel_safe(list_survivor) if not list_survivor.empty else pd.DataFrame()
+    possible_dups_safe = make_df_excel_safe(possible_dups) if not possible_dups.empty else pd.DataFrame()
+    stats_safe = make_df_excel_safe(stats)
+    interment_safe = make_df_excel_safe(interment_df) if not interment_df.empty else pd.DataFrame()
+    phone_ex_safe = make_df_excel_safe(phone_exceptions) if not phone_exceptions.empty else pd.DataFrame()
+
+    tmp_path = out_path + ".tmp.xlsx"
+    engine = choose_excel_engine()
+
+    with pd.ExcelWriter(tmp_path, engine=engine) as xw:
+        owners_master_safe.to_excel(xw, index=False, sheet_name="Owners_Master")
+        # v65: convenience sheet with only rows that need human review
+        try:
+            if 'NeedsReview' in owners_master_safe.columns:
+                nr = owners_master_safe[owners_master_safe['NeedsReview'] == True]
+                if not nr.empty:
+                    nr.to_excel(xw, index=False, sheet_name='NeedsReview')
+        except Exception:
+            pass
+        if not items_df_safe.empty:
+            items_df_safe.to_excel(xw, index=False, sheet_name="OwnerItems_Normalized")
+        if not list_memorial_safe.empty:
+            list_memorial_safe.to_excel(xw, index=False, sheet_name="LIST_Memorial_Letter")
+        if not list_pn_safe.empty:
+            list_pn_safe.to_excel(xw, index=False, sheet_name="LIST_PN_Funeral_Letter")
+        if not list_prime_safe.empty:
+            list_prime_safe.to_excel(xw, index=False, sheet_name="LIST_SpacesOnly_PRIME")
+        if not list_survivor_safe.empty:
+            list_survivor_safe.to_excel(xw, index=False, sheet_name="LIST_SurvivorSpouse_Opp")
+        if not possible_dups_safe.empty:
+            possible_dups_safe.to_excel(xw, index=False, sheet_name="PossibleDuplicateScans")
+        stats_safe.to_excel(xw, index=False, sheet_name="Stats")
+        if 'debug_df' in locals() and isinstance(debug_df, pd.DataFrame) and (not debug_df.empty):
+            make_df_excel_safe(debug_df).to_excel(xw, index=False, sheet_name='PropCand_NotClass')
+        if not interment_safe.empty:
+            interment_safe.to_excel(xw, index=False, sheet_name="LIST_Refile_IntermentRecords")
+        if not phone_ex_safe.empty:
+            phone_ex_safe.to_excel(xw, index=False, sheet_name="PhoneExceptions")
+
+    os.replace(tmp_path, out_path)
+    print(f"✅ Wrote: {out_path}")
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pdf_positional", nargs="?", help="PDF path (drag-drop)")
+    ap.add_argument("--pdf", default="", help="Input scanned PDF (optional if you drag-drop a PDF)")
+    ap.add_argument("--out", help="Output Excel path")
+    ap.add_argument("--dpi", type=int, default=300, help="OCR render DPI (fallback only)")
+    ap.add_argument("--kraken-model", default="", help="Optional: path to Kraken recognition model (.mlmodel) for handwriting last resort")
+    ap.add_argument("--kraken-bin", default="kraken", help="Kraken CLI executable (default: kraken)")
+    ap.add_argument("--kraken-python", default="/Users/john/.local/pipx/venvs/kraken/bin/python", help="Kraken Py3.11 env python; used to locate venv kraken executable")
+    ap.add_argument("--no-livetext", action="store_true", help="Disable ocrmac LiveText backend")
+    ap.add_argument("--alt-ocr", default="ocrmac_then_kraken", help="Alternate OCR order (last resort): ocrmac_then_kraken|kraken_then_ocrmac|none")
+    ap.add_argument("--facts", default="", help="Optional: FaCTS inventory export (.xlsx) for section validation")
+    args, _ = ap.parse_known_args()
+    # --- Drag/drop friendly: positional PDF/env defaults/auto-detect ---
+    if (not args.pdf) and getattr(args, "pdf_positional", None):
+        if isinstance(args.pdf_positional, str) and args.pdf_positional.lower().endswith(".pdf") and os.path.exists(args.pdf_positional):
+            args.pdf = args.pdf_positional
+
+    positional = _[:]
+    if (not args.pdf) and positional:
+        for tok in positional:
+            if isinstance(tok, str) and tok.lower().endswith('.pdf') and os.path.exists(tok):
+                args.pdf = tok
+                break
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    _set_snapshot_dir_for_script()
+    print(f"[Info] Failed snapshots folder: {FAILED_SNAPSHOT_DIR}")
+    if not args.pdf:
+        args.pdf = _auto_pick_pdf(script_dir)
+    if args.pdf and (not args.out):
+        args.out = _default_out_path(args.pdf)
+    if not args.kraken_model:
+        args.kraken_model = _auto_pick_kraken_model()
+
+
+    if args.pdf:
+        out = args.out if args.out else args.pdf.replace(".pdf", ".xlsx")
+        process_dataset(
+            args.pdf,
+            out,
+            args.dpi,
+            kraken_model=getattr(args, "kraken_model", ""),
+            kraken_bin=getattr(args, "kraken_bin", "kraken"),
+            kraken_python=getattr(args, "kraken_python", ""),
+            allow_livetext=(not getattr(args, "no_livetext", False)),
+            facts_path=args.facts,
+            alt_ocr=getattr(args, "alt_ocr", "ocrmac_then_kraken"),
+        )
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    pdf_files = sorted(glob.glob(os.path.join(script_dir, "* (all).pdf")))
+    if not pdf_files:
+        pdf_files = sorted(glob.glob("* (all).pdf"))
+        if not pdf_files:
+            print("❌ No '* (all).pdf' files found.")
+            return
+
+    print(f"✅ Found {len(pdf_files)} PDF(s): {[os.path.basename(f) for f in pdf_files]}")
+    for pdf_path in pdf_files:
+        filename = os.path.basename(pdf_path)
+        letter = filename.split(" ")[0]
+        out_path = os.path.join(os.path.dirname(pdf_path), f"OwnerCards_{letter}_Output.xlsx")
+        process_dataset(
+            pdf_path,
+            out_path,
+            dpi=args.dpi,
+            kraken_model=getattr(args, "kraken_model", ""),
+            kraken_bin=getattr(args, "kraken_bin", "kraken"),
+            kraken_python=getattr(args, "kraken_python", ""),
+            allow_livetext=(not getattr(args, "no_livetext", False)),
+            facts_path=args.facts,
+            alt_ocr=getattr(args, "alt_ocr", "ocrmac_then_kraken"),
+        )
+
+
+if __name__ == "__main__":
+    main()
