@@ -1319,7 +1319,7 @@ def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple
 
     Rule:
       - segment must be roughly within the line's vertical band (with small tolerance)
-      - horizontal overlap fraction >= 0.35
+      - horizontal overlap fraction >= 0.45
     """
     if not strike_segs:
         return False
@@ -1331,7 +1331,8 @@ def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple
     tol = 3
     for sx1, sy1, sx2, sy2 in strike_segs:
         # Ensure segment is horizontal-ish and within y-band
-        if not (y1 - tol <= sy1 <= y2 + tol):
+        sy_mid = (sy1 + sy2) / 2.0
+        if not (y1 - tol <= sy_mid <= y2 + tol):
             continue
 
         # Normalize segment x order
@@ -1344,7 +1345,7 @@ def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple
         h = max(1, y2 - y1)
         mid_top = y1 + int(0.2 * h)
         mid_bot = y2 - int(0.2 * h)
-        if not (mid_top <= sy1 <= mid_bot):
+        if not (mid_top <= sy_mid <= mid_bot):
             continue
         if (ov / line_w) >= 0.45:
             return True
