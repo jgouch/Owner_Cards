@@ -1660,6 +1660,7 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
     if not line:
         return None
     line2 = fix_state_ocr_tokens(line)
+    line2 = normalize_zip_candidates(line2)
     # Strip common labels that can block street-start detection
     line2 = re.sub(r"^\s*(address|addr|mailing address)\s*[:\-]\s*", "", line2, flags=re.IGNORECASE)
     line2 = line2.lstrip(" ,")
@@ -1750,7 +1751,7 @@ def parse_best_address(lines: List[str]) -> Dict:
                 return -999
             u = s.upper()
             sc = 0
-            if re.search(r"PO\s*BOX", u):
+            if re.search(r"\bPO\s*BOX\b", u):
                 sc += 25
             if re.search(r"\d", u):
                 sc += 40
@@ -1920,7 +1921,7 @@ def get_header_candidate(lines: List[str], addr_idx: Optional[int], target_char:
             sc -= 40
         if matches_any(ln, RE_ADDR_BLOCK):
             sc -= 25
-        if re.search(r"(LOT|SEC|SECTION|SP|SPACE|GARDEN|BLOCK|BLK)", u):
+        if re.search(r"\b(LOT|SEC|SECTION|SP|SPACE|GARDEN|BLOCK|BLK)\b", u):
             sc -= 60
         try:
             if extract_abbrev_tokens(u):
