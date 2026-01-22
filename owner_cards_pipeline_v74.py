@@ -238,7 +238,7 @@ def extract_abbrev_tokens(text: str):
     if not text:
         return []
     u = str(text).upper()
-    raw = re.findall(r"[A-Z]{1,3}(?:-[A-Z]{1,3})?|(?:[A-Z]\.){2,4}", u)
+    raw = re.findall(r"\b[A-Z]{1,3}(?:-[A-Z]{1,3})?\b|\b(?:[A-Z]\.){2,4}\b", u)
     toks=[]
     for t in raw:
         t2 = re.sub(r'[^A-Z0-9-]', '', t.replace('.', ''))
