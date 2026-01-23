@@ -2861,6 +2861,7 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
 
         if owner_data.get('IsBlankSeparator'):
             blanks_rows.append(owner_data)
+            continue
         if is_interment:
             interment_rows.append(owner_data)
         else:
@@ -3064,12 +3065,19 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
             s = "" if x is None else str(x)
             return bool(s.strip()) and s.strip().lower() != "nan"
 
+        idx = owners_master.index
+        phone_raw = owners_master["PhoneRaw"] if "PhoneRaw" in owners_master.columns else pd.Series("", index=idx)
+        phone_valid = owners_master["PhoneValid"] if "PhoneValid" in owners_master.columns else pd.Series(False, index=idx)
+        phone_norm = owners_master["PhoneNormalized"] if "PhoneNormalized" in owners_master.columns else pd.Series("", index=idx)
+        phone_alt_norm = owners_master["PhoneAltNormalized"] if "PhoneAltNormalized" in owners_master.columns else pd.Series("", index=idx)
+        phone_alt_valid = owners_master["PhoneAltValid"] if "PhoneAltValid" in owners_master.columns else pd.Series(True, index=idx)
+
         phone_exceptions = owners_master[
-            owners_master.get("PhoneRaw", "").apply(has_text) &
+            phone_raw.apply(has_text) &
             (
-                (owners_master.get("PhoneValid", False) == False) |
-                (owners_master.get("PhoneNormalized", "").apply(lambda x: not has_text(x))) |
-                ((owners_master.get("PhoneAltNormalized", "").apply(has_text)) & (owners_master.get("PhoneAltValid", True) == False))
+                (phone_valid == False) |
+                (phone_norm.apply(lambda x: not has_text(x))) |
+                (phone_alt_norm.apply(has_text) & (phone_alt_valid == False))
             )
         ].copy()
 
@@ -3079,7 +3087,7 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
         "PagesDetected": page_count,
         "OwnerRecords": int(len(owners_master)) if not owners_master.empty else 0,
         "IntermentRecordsFound": int(len(interment_df)) if not interment_df.empty else 0,
- "BlanksFound": int(len(blanks_df)) if not blanks_df.empty else 0,
+        "BlanksFound": int(len(blanks_df)) if not blanks_df.empty else 0,
         "PossibleDuplicateScans": int(len(possible_dups)) if not possible_dups.empty else 0,
         "LIST_Memorial_Letter": int(len(list_memorial)) if not list_memorial.empty else 0,
         "LIST_PN_Funeral_Letter": int(len(list_pn)) if not list_pn.empty else 0,
