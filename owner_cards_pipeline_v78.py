@@ -301,7 +301,7 @@ def build_facts_owner_index(facts_df: pd.DataFrame) -> dict:
         sptext = str(row.get(space_col,'') or '').strip()
         if not sptext:
             continue
-        m = re.search(r"LOT/SECTION\s*([0-9A-Z]+)\s*SPACE\s*(\d+)", sptext.upper())
+        m = re.search(r"LOT/SECTION\s*([0-9A-Z]+)\s*SPACE\s*([0-9A-Z]+(?:[-,][0-9A-Z]+)*)", sptext.upper())
 
         if m:
 
