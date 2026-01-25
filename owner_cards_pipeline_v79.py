@@ -2287,7 +2287,8 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
     if not zipm or not statem:
         return None
     if not re.search(STREET_START_RE, line2):
-        return None
+        if not re.search(r"\bPO\s*BOX\b", line2, flags=re.IGNORECASE):
+            return None
 
     z = zipm.group(0)
     st = normalize_state(statem.group(0))
@@ -3341,7 +3342,10 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
         if not dup.empty:
             possible_dups = owners_df.merge(dup, on="RawTextHash", how="inner").sort_values(["RawTextHash", "PageNumber"])
 
-    inc = items_df[items_df.get("Include", False) == True].copy() if not items_df.empty else pd.DataFrame()
+    if not items_df.empty and "Include" in items_df.columns:
+        inc = items_df[items_df["Include"] == True].copy()
+    else:
+        inc = pd.DataFrame()
     all_items = items_df.copy() if not items_df.empty else pd.DataFrame()
 
     # v70.10 debug: capture lines that look like property candidates but were not classified as property
@@ -3362,15 +3366,35 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
     debug_df = pd.DataFrame(debug_rows)
 
     def agg_owner(group: pd.DataFrame) -> pd.Series:
-        has_property = bool(group.get("IsProperty", False).any())
-        has_memorial = bool(group.get("IsMemorial", False).any())
-        has_pn = bool(group.get("IsFuneralPreneed", False).any())
-        has_an = bool(group.get("IsAtNeedFuneral", False).any())
+        if "IsProperty" in group.columns:
+            isprop = group["IsProperty"].fillna(False).astype(bool)
+            has_property = bool(isprop.any())
+        else:
+            isprop = None
+            has_property = False
+        if "IsMemorial" in group.columns:
+            ismem = group["IsMemorial"].fillna(False).astype(bool)
+            has_memorial = bool(ismem.any())
+        else:
+            ismem = None
+            has_memorial = False
+        if "IsFuneralPreneed" in group.columns:
+            ispn = group["IsFuneralPreneed"].fillna(False).astype(bool)
+            has_pn = bool(ispn.any())
+        else:
+            ispn = None
+            has_pn = False
+        if "IsAtNeedFuneral" in group.columns:
+            isan = group["IsAtNeedFuneral"].fillna(False).astype(bool)
+            has_an = bool(isan.any())
+        else:
+            isan = None
+            has_an = False
 
-        memorial_lines = group[group.get("IsMemorial", False) == True]["LineText"].tolist() if "LineText" in group else []
-        pn_lines = group[group.get("IsFuneralPreneed", False) == True]["LineText"].tolist() if "LineText" in group else []
-        an_lines = group[group.get("IsAtNeedFuneral", False) == True]["LineText"].tolist() if "LineText" in group else []
-        property_lines = group[group.get("IsProperty", False) == True]["LineText"].tolist() if "LineText" in group else []
+        memorial_lines = group.loc[ismem, "LineText"].tolist() if (ismem is not None and "LineText" in group.columns) else []
+        pn_lines = group.loc[ispn, "LineText"].tolist() if (ispn is not None and "LineText" in group.columns) else []
+        an_lines = group.loc[isan, "LineText"].tolist() if (isan is not None and "LineText" in group.columns) else []
+        property_lines = group.loc[isprop, "LineText"].tolist() if (isprop is not None and "LineText" in group.columns) else []
 
         likely_burials = compute_likely_burials(group.to_dict("records"))
         likely_burials_sum = compute_likely_burials_sum(group.to_dict("records"))
