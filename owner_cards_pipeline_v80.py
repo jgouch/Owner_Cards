@@ -1613,10 +1613,10 @@ def parse_modern_lotsec_sp(text: str) -> tuple[str, str]:
     if not text:
         return ('', '')
     u = normalize_prop_token(text)
-    m = re.search(r"(\d{1,4}[A-Z])\s+(\d{1,2})\s*$", u)
+    m = re.search(r"\b(\d{1,4}[A-Z])\b\s+\b(\d{1,2})\b\s*$", u)
     if m:
         return (m.group(1).strip(), _norm_sp(m.group(2).strip()))
-    m2 = re.search(r"(\d{1,4}[A-Z])\s+(\d{1,2})", u)
+    m2 = re.search(r"\b(\d{1,4}[A-Z])\b\s+\b(\d{1,2})\b", u)
     if m2:
         return (m2.group(1).strip(), _norm_sp(m2.group(2).strip()))
     return ('', '')
@@ -1637,7 +1637,7 @@ def has_strong_property_locator(text: str) -> bool:
             return True
     except Exception:
         pass
-    if re.search(r"(LOT|SEC|SECTION|SP|SPACE|BLK|BLOCK|CRYPT|NICHE|COLUMBARIUM|MAUS|MAUSOLEUM|COURTSIDE|BLDG|BUILDING|ROW|C/L|DEPTH)", u):
+    if re.search(r"\b(LOT|SEC|SECTION|SP|SPACE|BLK|BLOCK|CRYPT|NICHE|COLUMBARIUM|MAUS|MAUSOLEUM|COURTSIDE|BLDG|BUILDING|ROW|C/L|DEPTH)\b", u):
         return True
     lotsec, sp = parse_modern_lotsec_sp(u)
     return bool(lotsec and sp)
