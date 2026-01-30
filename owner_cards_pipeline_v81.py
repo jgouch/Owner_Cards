@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Owner Card Pipeline — v80 (Line Stitching + FaCTS Space Fallback + Notes OCR Lists)
+"""Owner Card Pipeline — v81 (Line Stitching + FaCTS Space Fallback + Notes OCR Lists)
 
 This version implements the issues you identified:
 1) Strikethrough detection parity: when using PDF text layer, we now run a quick strike-line scan.
